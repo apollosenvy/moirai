@@ -280,11 +280,13 @@ func cmdDaemon(args []string) {
 	})
 
 	srv := &api.Server{
-		Orch:      orch,
-		ModelMgr:  mm,
-		StartedAt: time.Now(),
-		Port:      cfg.Port,
-		ModelsDir: cfg.ModelsDir,
+		Orch:                orch,
+		ModelMgr:            mm,
+		StartedAt:           time.Now(),
+		Port:                cfg.Port,
+		ModelsDir:           cfg.ModelsDir,
+		TurboquantSupported: modelmgr.DetectTurboquant(cfg.LlamaServerBin),
+		DaemonVersion:       "dev",
 	}
 
 	httpSrv := &http.Server{

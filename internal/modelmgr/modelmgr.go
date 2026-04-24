@@ -22,6 +22,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -401,6 +402,24 @@ func (m *Manager) stop() error {
 // Shutdown tears down whatever is currently running. Call on daemon exit.
 func (m *Manager) Shutdown() error {
 	return m.stop()
+}
+
+// DetectTurboquant runs `<llamaServerBin> --help` and returns true if the
+// output mentions both "turbo3" and "turbo4" as KV cache options. Can be
+// forced via AGENT_ROUTER_FORCE_TURBOQUANT=1 env var.
+func DetectTurboquant(llamaServerBin string) bool {
+	if os.Getenv("AGENT_ROUTER_FORCE_TURBOQUANT") == "1" {
+		return true
+	}
+	if llamaServerBin == "" {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, llamaServerBin, "--help")
+	out, _ := cmd.CombinedOutput() // non-zero exit is fine; we just want the text
+	text := strings.ToLower(string(out))
+	return strings.Contains(text, "turbo3") && strings.Contains(text, "turbo4")
 }
 
 // waitReady polls the OpenAI-compatible /v1/models endpoint until success.

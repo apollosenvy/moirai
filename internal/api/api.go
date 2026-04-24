@@ -15,6 +15,7 @@ import (
 	"github.com/aegis/agent-router/internal/modelmgr"
 	"github.com/aegis/agent-router/internal/models"
 	"github.com/aegis/agent-router/internal/orchestrator"
+	"github.com/aegis/agent-router/internal/taskstore"
 )
 
 //go:embed index.html
@@ -29,6 +30,13 @@ type Server struct {
 	// ModelsDir is the filesystem directory scanned by GET /models for GGUF
 	// files. Slot-active model paths from outside this dir are merged in.
 	ModelsDir string
+
+	// TurboquantSupported is reported via /status so the UI can gate the
+	// turbo3/turbo4 KV options. Set by daemon main() after DetectTurboquant.
+	TurboquantSupported bool
+
+	// DaemonVersion appears in /status for UI display / debug.
+	DaemonVersion string
 
 	// ReadyFlag is flipped to true once the daemon has finished model-manager
 	// initialization, orchestrator task replay, and turboquant detection.
@@ -208,21 +216,45 @@ func (s *Server) handleUI(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	tasks, _ := s.Orch.Status()
 	running := 0
+	var activeTask *taskstore.Task
 	for _, t := range tasks {
 		if string(t.Status) == "running" {
 			running++
+			if activeTask == nil {
+				activeTask = t
+			}
 		}
 	}
+	var phase taskstore.Phase
+	if activeTask != nil {
+		phase = activeTask.Phase
+	}
+	verdict := s.Orch.LastVerdict()
+	nextSlots := orchestrator.NextSlots(phase, verdict, activeTask != nil)
+	reviewStage := orchestrator.ReviewStage(phase)
+
 	writeJSON(w, 200, map[string]any{
-		"service":      "agent-router",
-		"port":         s.Port,
-		"started_at":   s.StartedAt.UTC().Format(time.RFC3339),
-		"uptime":       time.Since(s.StartedAt).String(),
-		"active_slot":  s.ModelMgr.Active(),
-		"active_port":  s.ModelMgr.ActivePort(),
-		"task_count":   len(tasks),
-		"running":      running,
+		"service":              "agent-router",
+		"port":                 s.Port,
+		"started_at":           s.StartedAt.UTC().Format(time.RFC3339),
+		"uptime":               time.Since(s.StartedAt).String(),
+		"active_slot":          s.ModelMgr.Active(),
+		"active_port":          s.ModelMgr.ActivePort(),
+		"task_count":           len(tasks),
+		"running":              running,
+		"next_slots":           nextSlots,
+		"review_stage":         reviewStage,
+		"last_verdict":         nullIfEmpty(verdict),
+		"turboquant_supported": s.TurboquantSupported,
+		"daemon_version":       s.DaemonVersion,
 	})
+}
+
+func nullIfEmpty(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
 }
 
 func (s *Server) handleTasks(w http.ResponseWriter, r *http.Request) {
