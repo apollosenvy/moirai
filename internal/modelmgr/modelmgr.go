@@ -59,6 +59,14 @@ type Config struct {
 	BootTimeout    time.Duration
 }
 
+// PendingChanges is a partial ModelConfig update queued because the slot
+// was busy at PATCH time. All fields optional; zero values mean "no change".
+type PendingChanges struct {
+	ModelPath string `json:"model_path,omitempty"`
+	CtxSize   int    `json:"ctx_size,omitempty"`
+	KvCache   string `json:"kv_cache,omitempty"`
+}
+
 // Manager owns at most one live llama-server process at a time.
 type Manager struct {
 	cfg Config
@@ -69,6 +77,7 @@ type Manager struct {
 	port       int
 	logPath    string
 	started    time.Time
+	pending    map[Slot]PendingChanges // guarded by mu
 
 	// generating is true while a Complete() call is in flight against the
 	// active slot. Callers use markGenerating/IsGenerating to coordinate
@@ -108,7 +117,58 @@ func New(cfg Config) (*Manager, error) {
 	if err := os.MkdirAll(cfg.LogDir, 0o755); err != nil {
 		return nil, fmt.Errorf("modelmgr: mkdir log dir: %w", err)
 	}
-	return &Manager{cfg: cfg}, nil
+	return &Manager{cfg: cfg, pending: make(map[Slot]PendingChanges)}, nil
+}
+
+// SetPending queues a partial config change for the given slot, to be folded
+// in at the next natural transition point (slot swap).
+func (m *Manager) SetPending(slot Slot, p PendingChanges) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.pending[slot] = p
+}
+
+// GetPending returns the queued pending changes for slot, if any.
+func (m *Manager) GetPending(slot Slot) (PendingChanges, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	p, ok := m.pending[slot]
+	return p, ok
+}
+
+// ClearPending drops any queued pending changes for slot.
+func (m *Manager) ClearPending(slot Slot) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.pending, slot)
+}
+
+// ApplyPending folds queued changes into the slot's ModelConfig and
+// clears them. Returns true if there were pending changes.
+//
+// TODO: persist the updated ModelConfig back to the daemon config file so
+// the change survives a restart. For now, applied changes live only in
+// memory for the lifetime of the process.
+func (m *Manager) ApplyPending(slot Slot) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	p, ok := m.pending[slot]
+	if !ok {
+		return false
+	}
+	cfg := m.cfg.Models[slot]
+	if p.ModelPath != "" {
+		cfg.ModelPath = p.ModelPath
+	}
+	if p.CtxSize != 0 {
+		cfg.CtxSize = p.CtxSize
+	}
+	if p.KvCache != "" {
+		cfg.KvCache = p.KvCache
+	}
+	m.cfg.Models[slot] = cfg
+	delete(m.pending, slot)
+	return true
 }
 
 // SetSwapHook is called (from inside the manager mutex) whenever the active
@@ -145,6 +205,12 @@ func (m *Manager) EnsureSlot(ctx context.Context, slot Slot) (string, error) {
 	}
 	from := m.activeSlot
 	m.mu.Unlock()
+
+	// Apply any pending changes staged while the outgoing slot was busy --
+	// must happen before stop() so the next start() sees the updated cfg.
+	if from != "" && from != slot {
+		m.ApplyPending(from)
+	}
 
 	// Stop current (outside lock to avoid holding it across SIGTERM waits).
 	if err := m.stop(); err != nil {
