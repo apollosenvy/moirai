@@ -1,0 +1,470 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>AGENT-ROUTER</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  :root {
+    --gold: #ffd700;
+    --gold-dim: #b8961f;
+    --red: #c81e1e;
+    --black: #0a0a0a;
+    --panel: #141414;
+    --panel-2: #1c1c1c;
+    --border: #2a2a2a;
+    --border-hot: #3a3a3a;
+    --text: #e0d8c8;
+    --muted: #8a8270;
+    --ok: #5fb35f;
+    --warn: #e8a33d;
+    --err: #e05454;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0;
+    background: var(--black); color: var(--text);
+    font-family: "JetBrains Mono","Fira Code","DejaVu Sans Mono",monospace;
+    font-size: 13px; line-height: 1.4;
+  }
+  a { color: var(--gold); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  button, input, textarea, select {
+    font-family: inherit; font-size: inherit;
+    background: var(--panel-2); color: var(--text);
+    border: 1px solid var(--border);
+    padding: 6px 10px;
+  }
+  button {
+    background: var(--panel); color: var(--gold);
+    border: 1px solid var(--gold-dim);
+    cursor: pointer; text-transform: uppercase; letter-spacing: 1px;
+    padding: 8px 14px;
+  }
+  button:hover { background: var(--gold); color: var(--black); }
+  button.danger { color: var(--red); border-color: var(--red); }
+  button.danger:hover { background: var(--red); color: var(--black); }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+  input, textarea { width: 100%; }
+  textarea { resize: vertical; min-height: 120px; }
+
+  header {
+    border-bottom: 2px solid var(--gold-dim);
+    background: linear-gradient(180deg, #181410 0%, #0a0a0a 100%);
+    padding: 10px 16px;
+    display: flex; align-items: center; gap: 24px;
+  }
+  header .brand {
+    color: var(--gold); font-weight: bold;
+    text-transform: uppercase; letter-spacing: 3px;
+    font-size: 16px;
+  }
+  header .sep { color: var(--border-hot); }
+  header .stat { color: var(--muted); text-transform: uppercase; letter-spacing: 1px; font-size: 11px; }
+  header .stat b { color: var(--text); font-weight: normal; margin-left: 4px; }
+  header .stat b.hot { color: var(--gold); }
+  header .dot {
+    display: inline-block; width: 8px; height: 8px;
+    background: var(--muted); margin-right: 6px;
+    vertical-align: middle;
+  }
+  header .dot.live { background: var(--ok); box-shadow: 0 0 6px var(--ok); }
+  header .dot.dead { background: var(--err); }
+
+  main {
+    display: grid; grid-template-columns: 360px 1fr; gap: 0;
+    height: calc(100vh - 44px);
+  }
+  .col {
+    overflow-y: auto; border-right: 1px solid var(--border);
+  }
+  .col:last-child { border-right: none; }
+  .section {
+    border-bottom: 1px solid var(--border);
+    padding: 14px 16px;
+  }
+  .section h2 {
+    margin: 0 0 10px 0; color: var(--gold);
+    font-size: 12px; text-transform: uppercase; letter-spacing: 2px;
+    border-bottom: 1px solid var(--gold-dim); padding-bottom: 4px;
+  }
+  .section label {
+    display: block; color: var(--muted);
+    text-transform: uppercase; font-size: 10px; letter-spacing: 1px;
+    margin-top: 10px; margin-bottom: 4px;
+  }
+
+  table.tasks { width: 100%; border-collapse: collapse; }
+  table.tasks th, table.tasks td {
+    text-align: left; padding: 6px 10px;
+    border-bottom: 1px solid var(--border);
+  }
+  table.tasks th {
+    color: var(--gold-dim);
+    text-transform: uppercase; font-size: 10px; letter-spacing: 1px;
+    background: var(--panel);
+    position: sticky; top: 0;
+  }
+  table.tasks tr { cursor: pointer; }
+  table.tasks tr:hover td { background: var(--panel); }
+  table.tasks tr.selected td { background: #1f1a10; }
+  table.tasks .desc { max-width: 340px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  table.tasks .id { color: var(--muted); font-size: 11px; }
+
+  .status {
+    display: inline-block; padding: 1px 6px;
+    border: 1px solid currentColor; text-transform: uppercase;
+    font-size: 10px; letter-spacing: 1px;
+  }
+  .status.running { color: var(--gold); }
+  .status.succeeded { color: var(--ok); }
+  .status.failed { color: var(--err); }
+  .status.aborted { color: var(--muted); }
+  .status.pending { color: var(--warn); }
+  .status.interrupted { color: var(--warn); }
+  .status.awaiting_user { color: var(--warn); }
+
+  pre {
+    background: var(--panel-2); border: 1px solid var(--border);
+    padding: 10px; margin: 6px 0;
+    white-space: pre-wrap; word-break: break-word;
+    max-height: 360px; overflow-y: auto;
+    font-size: 12px;
+  }
+  .kv { display: grid; grid-template-columns: 140px 1fr; gap: 4px 12px; }
+  .kv .k { color: var(--muted); text-transform: uppercase; font-size: 11px; letter-spacing: 1px; }
+  .kv .v { color: var(--text); word-break: break-all; }
+
+  .trace { font-size: 11px; }
+  .trace .evt {
+    padding: 4px 8px; margin: 2px 0;
+    border-left: 2px solid var(--border-hot);
+    background: var(--panel-2);
+  }
+  .trace .evt.llm_call { border-left-color: var(--gold); }
+  .trace .evt.tool_call { border-left-color: #5fb3d4; }
+  .trace .evt.tool_result { border-left-color: #5fb3d4; opacity: 0.8; }
+  .trace .evt.phase { border-left-color: var(--warn); }
+  .trace .evt.error { border-left-color: var(--err); }
+  .trace .evt .ts { color: var(--muted); margin-right: 8px; }
+  .trace .evt .kind { color: var(--gold-dim); text-transform: uppercase; font-size: 10px; letter-spacing: 1px; }
+
+  .empty { color: var(--muted); padding: 40px 16px; text-align: center; font-style: italic; }
+
+  .toast {
+    position: fixed; bottom: 20px; right: 20px;
+    background: var(--panel); color: var(--gold);
+    border: 1px solid var(--gold-dim); padding: 10px 16px;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.6);
+    display: none;
+  }
+  .toast.err { color: var(--err); border-color: var(--err); }
+  .toast.show { display: block; }
+
+  .hr { border: none; border-top: 1px solid var(--border); margin: 14px 0; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="brand">&#9876; AGENT-ROUTER</div>
+  <div class="sep">|</div>
+  <div class="stat"><span id="live-dot" class="dot"></span><span id="live-label">CONNECTING</span></div>
+  <div class="stat">SLOT <b class="hot" id="s-slot">--</b></div>
+  <div class="stat">SLOT-PORT <b id="s-port">--</b></div>
+  <div class="stat">RUNNING <b id="s-running">0</b></div>
+  <div class="stat">TASKS <b id="s-tasks">0</b></div>
+  <div class="stat">UPTIME <b id="s-uptime">--</b></div>
+  <div style="flex:1"></div>
+  <div class="stat">API :<b id="s-api-port">--</b></div>
+</header>
+
+<main>
+
+  <div class="col">
+    <div class="section">
+      <h2>&#9733; Submit Task</h2>
+      <label>Description</label>
+      <textarea id="submit-desc" placeholder="Plan, code, and review a task. Paste a spec, drop a multi-line prompt, keep it concrete."></textarea>
+      <label>Repo Root <span style="color:var(--muted);text-transform:none;letter-spacing:0;font-size:10px">(absolute path, empty = scratch dir)</span></label>
+      <input id="submit-repo" placeholder="/home/aegis/Projects/&lt;project&gt;">
+      <div class="hr"></div>
+      <button id="submit-btn">Submit Task</button>
+      <button id="submit-clear">Clear</button>
+    </div>
+
+    <div class="section">
+      <h2>&#9889; Quick Prompts</h2>
+      <div id="quick-prompts"></div>
+    </div>
+  </div>
+
+  <div class="col">
+    <div class="section" style="padding:0">
+      <div style="display:flex;align-items:center;justify-content:space-between;padding:14px 16px 6px 16px">
+        <h2 style="margin:0;border:0;padding:0">&#9776; Tasks</h2>
+        <div>
+          <button id="refresh-btn" style="padding:4px 10px">Refresh</button>
+          <label style="display:inline;text-transform:none;font-size:11px;color:var(--muted);margin-left:8px">
+            <input type="checkbox" id="auto-refresh" checked style="width:auto;margin-right:4px">auto 3s
+          </label>
+        </div>
+      </div>
+      <div id="task-list"><div class="empty">Loading&hellip;</div></div>
+    </div>
+
+    <div class="section" id="detail-section" style="display:none">
+      <h2>&#9679; <span id="detail-id">Task Detail</span>
+        <button id="abort-btn" class="danger" style="float:right;padding:2px 8px;font-size:10px">Abort</button>
+      </h2>
+      <div class="kv" id="detail-kv"></div>
+      <div class="hr"></div>
+      <label style="display:block;color:var(--gold-dim);text-transform:uppercase;font-size:11px;letter-spacing:1px;margin-bottom:4px">Plan</label>
+      <pre id="detail-plan"></pre>
+      <label style="display:block;color:var(--gold-dim);text-transform:uppercase;font-size:11px;letter-spacing:1px;margin-bottom:4px">Reviews</label>
+      <pre id="detail-reviews"></pre>
+      <label style="display:block;color:var(--gold-dim);text-transform:uppercase;font-size:11px;letter-spacing:1px;margin-bottom:4px">Recent Trace Events</label>
+      <div class="trace" id="detail-trace"></div>
+    </div>
+  </div>
+
+</main>
+
+<div class="toast" id="toast"></div>
+
+<script>
+"use strict";
+
+const $ = sel => document.querySelector(sel);
+const $$ = sel => document.querySelectorAll(sel);
+
+let selectedId = null;
+let pollTimer = null;
+
+function toast(msg, isErr) {
+  const el = $("#toast");
+  el.textContent = msg;
+  el.className = "toast show" + (isErr ? " err" : "");
+  setTimeout(() => el.classList.remove("show"), 3500);
+}
+
+async function jget(path) {
+  const r = await fetch(path);
+  if (!r.ok) throw new Error(path + " " + r.status);
+  return await r.json();
+}
+async function jpost(path, body) {
+  const r = await fetch(path, {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: body == null ? "" : JSON.stringify(body),
+  });
+  const text = await r.text();
+  let data; try { data = JSON.parse(text); } catch(_) { data = {raw: text}; }
+  if (!r.ok) {
+    const err = data && data.error ? data.error : ("HTTP " + r.status);
+    throw new Error(err);
+  }
+  return data;
+}
+
+function fmtDate(s) {
+  if (!s) return "--";
+  try {
+    const d = new Date(s);
+    const pad = n => String(n).padStart(2, "0");
+    return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  } catch(_) { return s; }
+}
+
+function shortId(id) {
+  if (!id) return "--";
+  return id.length > 24 ? id.substring(0, 24) : id;
+}
+
+async function refreshStatus() {
+  try {
+    const s = await jget("/status");
+    $("#live-dot").className = "dot live";
+    $("#live-label").textContent = "LIVE";
+    $("#s-slot").textContent = s.active_slot || "--";
+    $("#s-port").textContent = s.active_port || "--";
+    $("#s-running").textContent = s.running || 0;
+    $("#s-tasks").textContent = s.task_count || 0;
+    $("#s-uptime").textContent = s.uptime || "--";
+    $("#s-api-port").textContent = s.port || "--";
+  } catch (e) {
+    $("#live-dot").className = "dot dead";
+    $("#live-label").textContent = "OFFLINE";
+  }
+}
+
+async function refreshTasks() {
+  try {
+    const tasks = await jget("/tasks");
+    const list = $("#task-list");
+    if (!tasks || tasks.length === 0) {
+      list.innerHTML = '<div class="empty">No tasks yet. Submit one &larr;</div>';
+      return;
+    }
+    let html = '<table class="tasks"><thead><tr>';
+    html += '<th>When</th><th>ID</th><th>Status</th><th>Phase</th><th>Iter</th><th>Desc</th>';
+    html += '</tr></thead><tbody>';
+    for (const t of tasks) {
+      const sel = (t.id === selectedId) ? " selected" : "";
+      const desc = (t.description || "").replace(/[<>&]/g, c => ({"<":"&lt;",">":"&gt;","&":"&amp;"})[c]);
+      html += `<tr class="${sel}" data-id="${t.id}">`;
+      html += `<td>${fmtDate(t.updated_at)}</td>`;
+      html += `<td class="id">${shortId(t.id)}</td>`;
+      html += `<td><span class="status ${t.status}">${t.status}</span></td>`;
+      html += `<td>${t.phase || "--"}</td>`;
+      html += `<td>${t.iterations || 0}</td>`;
+      html += `<td class="desc" title="${desc}">${desc}</td>`;
+      html += "</tr>";
+    }
+    html += "</tbody></table>";
+    list.innerHTML = html;
+    list.querySelectorAll("tr[data-id]").forEach(tr => {
+      tr.addEventListener("click", () => selectTask(tr.getAttribute("data-id")));
+    });
+    if (selectedId) {
+      refreshDetail(selectedId);
+    }
+  } catch (e) {
+    $("#task-list").innerHTML = `<div class="empty" style="color:var(--err)">${e.message}</div>`;
+  }
+}
+
+async function selectTask(id) {
+  selectedId = id;
+  $$("#task-list tr[data-id]").forEach(tr => {
+    tr.classList.toggle("selected", tr.getAttribute("data-id") === id);
+  });
+  $("#detail-section").style.display = "block";
+  $("#detail-id").textContent = shortId(id);
+  await refreshDetail(id);
+  $("#detail-section").scrollIntoView({behavior: "smooth", block: "start"});
+}
+
+async function refreshDetail(id) {
+  try {
+    const d = await jget("/tasks/" + encodeURIComponent(id));
+    const t = d.task || {};
+    const kv = $("#detail-kv");
+    const rows = [
+      ["ID", t.id],
+      ["Status", `<span class="status ${t.status}">${t.status}</span>`],
+      ["Phase", t.phase],
+      ["Iterations", t.iterations],
+      ["Replans", t.replans],
+      ["Active Model", t.active_model || "--"],
+      ["Repo Root", t.repo_root || "--"],
+      ["Branch", t.branch || "--"],
+      ["Created", fmtDate(t.created_at)],
+      ["Updated", fmtDate(t.updated_at)],
+      ["Last Error", t.last_error || ""],
+      ["Description", (t.description || "").substring(0, 400)],
+    ];
+    kv.innerHTML = rows.map(([k,v]) => `<div class="k">${k}</div><div class="v">${v == null ? "" : v}</div>`).join("");
+
+    $("#detail-plan").textContent = t.plan || "(no plan yet)";
+    $("#detail-reviews").textContent = (t.reviews && t.reviews.length) ? t.reviews.join("\n\n---\n\n") : "(no reviews yet)";
+
+    const trace = $("#detail-trace");
+    const events = d.recent || [];
+    if (events.length === 0) {
+      trace.innerHTML = '<div class="empty" style="padding:20px">(no trace events)</div>';
+    } else {
+      trace.innerHTML = events.map(e => {
+        const ts = e.ts ? new Date(e.ts).toLocaleTimeString() : "";
+        const kind = e.kind || "?";
+        const data = e.data ? JSON.stringify(e.data) : "";
+        return `<div class="evt ${kind}"><span class="ts">${ts}</span><span class="kind">${kind}</span> ${data.substring(0, 400).replace(/[<>&]/g, c => ({"<":"&lt;",">":"&gt;","&":"&amp;"})[c])}</div>`;
+      }).join("");
+    }
+
+    const canAbort = t.status === "running" || t.status === "pending";
+    $("#abort-btn").disabled = !canAbort;
+  } catch (e) {
+    $("#detail-kv").innerHTML = `<div class="k">Error</div><div class="v" style="color:var(--err)">${e.message}</div>`;
+  }
+}
+
+async function submitTask() {
+  const desc = $("#submit-desc").value.trim();
+  const repo = $("#submit-repo").value.trim();
+  if (!desc) { toast("description required", true); return; }
+  $("#submit-btn").disabled = true;
+  try {
+    const t = await jpost("/submit", {description: desc, repo_root: repo});
+    toast("Submitted: " + shortId(t.id));
+    $("#submit-desc").value = "";
+    await refreshTasks();
+    if (t.id) await selectTask(t.id);
+  } catch (e) {
+    toast(e.message, true);
+  } finally {
+    $("#submit-btn").disabled = false;
+  }
+}
+
+async function abortSelected() {
+  if (!selectedId) return;
+  if (!confirm("Abort " + shortId(selectedId) + "?")) return;
+  try {
+    await jpost("/tasks/" + encodeURIComponent(selectedId) + "/abort", {});
+    toast("Aborted");
+    await refreshTasks();
+  } catch (e) {
+    toast(e.message, true);
+  }
+}
+
+const QUICK_PROMPTS = [
+  ["hello.py", "Create hello.py that prints hi. Test it runs."],
+  ["add README", "Add a README.md describing this repo's purpose in 3 bullets."],
+  ["LRU decorator", "Implement a small lru_cache-style decorator in Python with size limit + hit/miss stats. Include tests."],
+  ["Aegis-viz scaffold", "See /tmp/aegis_viz_task.txt for the full spec. Build the C++/Vulkan skeleton described there."],
+];
+
+function renderQuickPrompts() {
+  const root = $("#quick-prompts");
+  root.innerHTML = QUICK_PROMPTS.map((p, i) =>
+    `<button style="display:block;width:100%;text-align:left;margin-bottom:6px;padding:6px 10px;font-size:11px" data-idx="${i}">&#9656; ${p[0]}</button>`
+  ).join("");
+  root.querySelectorAll("button").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const idx = +btn.getAttribute("data-idx");
+      $("#submit-desc").value = QUICK_PROMPTS[idx][1];
+      $("#submit-desc").focus();
+    });
+  });
+}
+
+function startPolling() {
+  if (pollTimer) clearInterval(pollTimer);
+  pollTimer = setInterval(() => {
+    if ($("#auto-refresh").checked) {
+      refreshStatus();
+      refreshTasks();
+    }
+  }, 3000);
+}
+
+// wire up
+$("#submit-btn").addEventListener("click", submitTask);
+$("#submit-clear").addEventListener("click", () => { $("#submit-desc").value = ""; $("#submit-repo").value = ""; });
+$("#refresh-btn").addEventListener("click", () => { refreshStatus(); refreshTasks(); });
+$("#abort-btn").addEventListener("click", abortSelected);
+$("#submit-desc").addEventListener("keydown", e => {
+  if ((e.ctrlKey || e.metaKey) && e.key === "Enter") submitTask();
+});
+
+renderQuickPrompts();
+refreshStatus();
+refreshTasks();
+startPolling();
+</script>
+
+</body>
+</html>

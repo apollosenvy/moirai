@@ -1,0 +1,29 @@
+# Build artifacts
+bin/
+build/
+/phos/build/
+/phos/ui/node_modules/
+/phos/ui/dist/
+
+# IDE
+.vscode/
+.idea/
+
+# Environment
+.env
+.env.local
+
+# OS
+.DS_Store
+*.swp
+
+# Logs
+*.log
+
+# Go
+*.test
+*.out
+
+# Test output
+coverage.out
+coverage.html
