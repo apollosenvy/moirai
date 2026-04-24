@@ -4,6 +4,7 @@ build/
 /phos/build/
 /phos/ui/node_modules/
 /phos/ui/dist/
+/phos/ui/tsconfig.tsbuildinfo
 
 # IDE
 .vscode/
