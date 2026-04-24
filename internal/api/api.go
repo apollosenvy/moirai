@@ -162,8 +162,8 @@ func (s *Server) handleSlotsByID(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{"applied": false, "pending": true, "reason": "busy"})
 		return
 	}
-	// Loaded but idle -- queue until the next natural swap. See DEVIATION in
-	// the commit message / SPEC_DEVIATIONS.md for the reasoning.
+	// Loaded but idle -- queue until the next natural swap. See DEVIATION
+	// note in the originating commit for the reasoning.
 	s.ModelMgr.SetPending(slot, pending)
 	writeJSON(w, 200, map[string]any{"applied": false, "pending": true, "reason": "queued-for-next-swap"})
 }
@@ -243,7 +243,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"task_count":           len(tasks),
 		"running":              running,
 		"next_slots":           nextSlots,
-		"review_stage":         reviewStage,
+		"review_stage":         nullIfEmpty(reviewStage),
 		"last_verdict":         nullIfEmpty(verdict),
 		"turboquant_supported": s.TurboquantSupported,
 		"daemon_version":       s.DaemonVersion,
