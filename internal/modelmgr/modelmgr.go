@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -69,7 +70,25 @@ type Manager struct {
 	logPath    string
 	started    time.Time
 
+	// generating is true while a Complete() call is in flight against the
+	// active slot. Callers use markGenerating/IsGenerating to coordinate
+	// pending config changes. Atomic so IsGenerating is lock-free for
+	// hot-path status reads.
+	generating atomic.Bool
+
 	onSwap func(from, to Slot)
+}
+
+// IsGenerating reports whether a Complete() call is currently in flight.
+func (m *Manager) IsGenerating() bool {
+	return m.generating.Load()
+}
+
+// markGenerating flips generating=true and returns a deferred release fn.
+// Use: defer m.markGenerating()()
+func (m *Manager) markGenerating() func() {
+	m.generating.Store(true)
+	return func() { m.generating.Store(false) }
 }
 
 // New builds a Manager. No process is spawned yet.
@@ -301,6 +320,8 @@ type chatResponse struct {
 
 // Complete returns the assistant message text.
 func (m *Manager) Complete(ctx context.Context, req ChatRequest) (string, error) {
+	release := m.markGenerating()
+	defer release()
 	m.mu.Lock()
 	port := m.port
 	m.mu.Unlock()
