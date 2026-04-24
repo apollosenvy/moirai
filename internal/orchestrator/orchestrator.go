@@ -94,6 +94,25 @@ type Orchestrator struct {
 
 	mu      sync.Mutex
 	running map[string]*runState
+
+	vmu           sync.Mutex
+	lastVerdict   string
+	lastVerdictAt time.Time
+}
+
+// LastVerdict returns the most recent verdict emitted by the Reviewer,
+// or "" if none yet.
+func (o *Orchestrator) LastVerdict() string {
+	o.vmu.Lock()
+	defer o.vmu.Unlock()
+	return o.lastVerdict
+}
+
+func (o *Orchestrator) setLastVerdict(v string) {
+	o.vmu.Lock()
+	defer o.vmu.Unlock()
+	o.lastVerdict = v
+	o.lastVerdictAt = time.Now()
 }
 
 type runState struct {
@@ -314,6 +333,7 @@ func (o *Orchestrator) run(ctx context.Context, st *runState) {
 	})
 
 	if o.cfg.L2 != nil {
+		o.setLastVerdict("succeeded")
 		_ = o.cfg.L2.RecordVerdict(t.RepoRoot, t.ID, "final", "succeeded", shorten(summary, 4000))
 	}
 }
