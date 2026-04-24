@@ -44,6 +44,10 @@ type ModelConfig struct {
 	NGpuLayers int    `json:"n_gpu_layers"`
 	Port       int    `json:"port"`
 	ExtraArgs  []string `json:"extra_args,omitempty"`
+	// KvCache selects the KV cache quantization passed to llama-server as
+	// -ctk/-ctv. Valid values: "" (default/f16), "q8_0", "q5_1", "q4_0",
+	// "turbo3", "turbo4". Empty string means vanilla llama.cpp default.
+	KvCache string `json:"kv_cache,omitempty"`
 }
 
 // Config drives the manager.
@@ -151,7 +155,7 @@ func (m *Manager) EnsureSlot(ctx context.Context, slot Slot) (string, error) {
 	return fmt.Sprintf("http://127.0.0.1:%d", cfg.Port), nil
 }
 
-func (m *Manager) start(ctx context.Context, slot Slot, cfg ModelConfig) error {
+func buildLlamaArgs(cfg ModelConfig) []string {
 	args := []string{
 		"--model", cfg.ModelPath,
 		"--port", strconv.Itoa(cfg.Port),
@@ -163,7 +167,15 @@ func (m *Manager) start(ctx context.Context, slot Slot, cfg ModelConfig) error {
 	if cfg.NGpuLayers != 0 {
 		args = append(args, "-ngl", strconv.Itoa(cfg.NGpuLayers))
 	}
+	if cfg.KvCache != "" {
+		args = append(args, "-ctk", cfg.KvCache, "-ctv", cfg.KvCache)
+	}
 	args = append(args, cfg.ExtraArgs...)
+	return args
+}
+
+func (m *Manager) start(ctx context.Context, slot Slot, cfg ModelConfig) error {
+	args := buildLlamaArgs(cfg)
 
 	logPath := filepath.Join(m.cfg.LogDir, fmt.Sprintf("llama-%s.log", slot))
 	logFile, err := os.Create(logPath)
