@@ -122,11 +122,23 @@ func New(cfg Config) (*Manager, error) {
 }
 
 // SetPending queues a partial config change for the given slot, to be folded
-// in at the next natural transition point (slot swap).
+// in at the next natural transition point (slot swap). Merges non-zero fields
+// of p over any existing pending entry so sequential PATCHes accumulate rather
+// than overwriting each other.
 func (m *Manager) SetPending(slot Slot, p PendingChanges) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.pending[slot] = p
+	existing := m.pending[slot]
+	if p.ModelPath != "" {
+		existing.ModelPath = p.ModelPath
+	}
+	if p.CtxSize != 0 {
+		existing.CtxSize = p.CtxSize
+	}
+	if p.KvCache != "" {
+		existing.KvCache = p.KvCache
+	}
+	m.pending[slot] = existing
 }
 
 // GetPending returns the queued pending changes for slot, if any.
@@ -292,7 +304,9 @@ func (m *Manager) EnsureSlot(ctx context.Context, slot Slot) (string, error) {
 		fmt.Fprintf(os.Stderr, "modelmgr: stop during swap: %v\n", err)
 	}
 
+	m.mu.Lock()
 	cfg, ok := m.cfg.Models[slot]
+	m.mu.Unlock()
 	if !ok {
 		return "", fmt.Errorf("modelmgr: no config for slot %q", slot)
 	}

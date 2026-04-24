@@ -17,6 +17,27 @@ func TestSetPendingChanges(t *testing.T) {
 	}
 }
 
+func TestSetPendingMergesSequentialCalls(t *testing.T) {
+	m, _ := New(Config{
+		LlamaServerBin: "/bin/true",
+		Models: map[Slot]ModelConfig{
+			SlotPlanner: {Slot: SlotPlanner, ModelPath: "/tmp/a.gguf", Port: 9000, CtxSize: 8192},
+		},
+	})
+	m.SetPending(SlotPlanner, PendingChanges{KvCache: "turbo3"})
+	m.SetPending(SlotPlanner, PendingChanges{CtxSize: 16384})
+	got, ok := m.GetPending(SlotPlanner)
+	if !ok {
+		t.Fatal("expected pending present after two SetPending calls")
+	}
+	if got.KvCache != "turbo3" {
+		t.Errorf("second SetPending clobbered earlier KvCache; got %q, want turbo3", got.KvCache)
+	}
+	if got.CtxSize != 16384 {
+		t.Errorf("CtxSize not applied; got %d, want 16384", got.CtxSize)
+	}
+}
+
 func TestClearPendingChanges(t *testing.T) {
 	m, _ := New(Config{
 		LlamaServerBin: "/bin/true",
