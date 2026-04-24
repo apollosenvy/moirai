@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/aegis/agent-router/internal/modelmgr"
+	"github.com/aegis/agent-router/internal/models"
 	"github.com/aegis/agent-router/internal/orchestrator"
 )
 
@@ -22,6 +23,10 @@ type Server struct {
 	ModelMgr  *modelmgr.Manager
 	StartedAt time.Time
 	Port      int
+
+	// ModelsDir is the filesystem directory scanned by GET /models for GGUF
+	// files. Slot-active model paths from outside this dir are merged in.
+	ModelsDir string
 
 	// ReadyFlag is flipped to true once the daemon has finished model-manager
 	// initialization, orchestrator task replay, and turboquant detection.
@@ -38,6 +43,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.HandleFunc("/ready", s.handleReady)
 	mux.HandleFunc("/slots", s.handleSlots)
+	mux.HandleFunc("/models", s.handleModels)
 	mux.HandleFunc("/", s.handleUI)
 	return mux
 }
@@ -48,6 +54,26 @@ func (s *Server) handleSlots(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, s.ModelMgr.SlotsView())
+}
+
+func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, 405, map[string]string{"error": "GET required"})
+		return
+	}
+	infos, err := models.ListGGUF(s.ModelsDir)
+	if err != nil {
+		writeJSON(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+	// Include current slot model paths even if outside ModelsDir.
+	slots := s.ModelMgr.SlotsView()
+	paths := make([]string, 0, len(slots))
+	for _, sl := range slots {
+		paths = append(paths, sl.ModelPath)
+	}
+	infos = models.IncludeCurrent(infos, paths)
+	writeJSON(w, 200, infos)
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {

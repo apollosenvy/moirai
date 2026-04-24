@@ -3,9 +3,14 @@ package api
 import (
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/aegis/agent-router/internal/modelmgr"
 )
 
 func newTestServer(ready bool) *Server {
@@ -54,3 +59,41 @@ var _ = atomic.Bool{}
 
 // Ensure package import doesn't get flagged unused if we trim later.
 var _ = http.StatusOK
+
+func TestModelsEndpointReturnsGGUFs(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{"alpha.gguf", "beta.gguf", "skip.txt"} {
+		f, err := os.Create(filepath.Join(dir, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		f.Truncate(1024)
+		f.Close()
+	}
+	s := newTestServer(true)
+	s.ModelsDir = dir
+	mgr, err := modelmgr.New(modelmgr.Config{
+		LlamaServerBin: "/bin/true",
+		Models: map[modelmgr.Slot]modelmgr.ModelConfig{
+			modelmgr.SlotPlanner: {Slot: modelmgr.SlotPlanner, ModelPath: "/tmp/x.gguf", Port: 9001},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.ModelMgr = mgr
+
+	req := httptest.NewRequest("GET", "/models", nil)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("status %d body %s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "alpha") || !strings.Contains(body, "beta") {
+		t.Errorf("expected alpha+beta in body, got %s", body)
+	}
+	if strings.Contains(body, "skip") {
+		t.Errorf("expected non-gguf filtered out, got %s", body)
+	}
+}

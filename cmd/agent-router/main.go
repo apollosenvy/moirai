@@ -51,6 +51,9 @@ type Config struct {
 	// a 7900 XTX routinely take 60-120s; allow generous headroom by
 	// default. Override via config.
 	BootTimeoutSeconds int                             `json:"boot_timeout_seconds,omitempty"`
+	// ModelsDir is the filesystem directory scanned by GET /models for
+	// available GGUF files. Defaults to ~/models.
+	ModelsDir string `json:"models_dir,omitempty"`
 }
 
 func defaultConfig() Config {
@@ -108,6 +111,7 @@ func defaultConfig() Config {
 		LogDir:          filepath.Join(base, "logs"),
 		MaxCoderRetries: 5,
 		MaxReplans:      3,
+		ModelsDir:       filepath.Join(home, "models"),
 	}
 }
 
@@ -159,6 +163,9 @@ func mergeConfig(base *Config, o Config) {
 	}
 	if o.MaxReplans != 0 {
 		base.MaxReplans = o.MaxReplans
+	}
+	if o.ModelsDir != "" {
+		base.ModelsDir = o.ModelsDir
 	}
 	for k, v := range o.Models {
 		base.Models[k] = v
@@ -277,6 +284,7 @@ func cmdDaemon(args []string) {
 		ModelMgr:  mm,
 		StartedAt: time.Now(),
 		Port:      cfg.Port,
+		ModelsDir: cfg.ModelsDir,
 	}
 
 	httpSrv := &http.Server{
