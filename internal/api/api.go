@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sync/atomic"
 	"time"
 
 	"github.com/aegis/agent-router/internal/modelmgr"
@@ -21,6 +22,11 @@ type Server struct {
 	ModelMgr  *modelmgr.Manager
 	StartedAt time.Time
 	Port      int
+
+	// ReadyFlag is flipped to true once the daemon has finished model-manager
+	// initialization, orchestrator task replay, and turboquant detection.
+	// Daemon main() should call s.ReadyFlag.Store(true) as its last startup step.
+	ReadyFlag atomic.Bool
 }
 
 func (s *Server) Handler() http.Handler {
@@ -29,11 +35,22 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/tasks", s.handleTasks)
 	mux.HandleFunc("/tasks/", s.handleTasksByID)
 	mux.HandleFunc("/submit", s.handleSubmit)
-	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, 200, map[string]string{"ok": "true"})
-	})
+	mux.HandleFunc("/health", s.handleHealth)
+	mux.HandleFunc("/ready", s.handleReady)
 	mux.HandleFunc("/", s.handleUI)
 	return mux
+}
+
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, map[string]string{"ok": "true"})
+}
+
+func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
+	if s.ReadyFlag.Load() {
+		writeJSON(w, 200, map[string]any{"ready": true})
+		return
+	}
+	writeJSON(w, 503, map[string]any{"ready": false, "waiting_on": []string{"initializing"}})
 }
 
 // handleUI serves the embedded single-page dashboard. Only responds at the

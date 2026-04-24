@@ -287,6 +287,10 @@ func cmdDaemon(args []string) {
 	sigc := make(chan os.Signal, 1)
 	signal.Notify(sigc, syscall.SIGINT, syscall.SIGTERM)
 
+	// Daemon is fully initialized: modelmgr built, taskstore replayed, orchestrator
+	// wired. Flip the ready flag so /ready flips to 200.
+	srv.ReadyFlag.Store(true)
+
 	go func() {
 		fmt.Fprintf(os.Stderr, "agent-router listening on %s\n", httpSrv.Addr)
 		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
