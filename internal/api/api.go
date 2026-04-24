@@ -37,8 +37,17 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/submit", s.handleSubmit)
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.HandleFunc("/ready", s.handleReady)
+	mux.HandleFunc("/slots", s.handleSlots)
 	mux.HandleFunc("/", s.handleUI)
 	return mux
+}
+
+func (s *Server) handleSlots(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, 405, map[string]string{"error": "GET required"})
+		return
+	}
+	writeJSON(w, 200, s.ModelMgr.SlotsView())
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {

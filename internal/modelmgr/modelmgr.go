@@ -171,6 +171,75 @@ func (m *Manager) ApplyPending(slot Slot) bool {
 	return true
 }
 
+// SlotView is the public snapshot of a slot's state.
+type SlotView struct {
+	Slot           Slot            `json:"slot"`
+	RoleLabel      string          `json:"role_label"`
+	ModelPath      string          `json:"model_path"`
+	ModelName      string          `json:"model_name"`
+	CtxSize        int             `json:"ctx_size"`
+	KvCache        string          `json:"kv_cache"`
+	Loaded         bool            `json:"loaded"`
+	ListenPort     int             `json:"listen_port"`
+	Generating     bool            `json:"generating"`
+	PendingChanges *PendingChanges `json:"pending_changes,omitempty"`
+}
+
+// SlotsView returns snapshots of all configured slots.
+func (m *Manager) SlotsView() []SlotView {
+	m.mu.Lock()
+	active := m.activeSlot
+	pending := make(map[Slot]PendingChanges, len(m.pending))
+	for k, v := range m.pending {
+		pending[k] = v
+	}
+	cfgs := make(map[Slot]ModelConfig, len(m.cfg.Models))
+	for k, v := range m.cfg.Models {
+		cfgs[k] = v
+	}
+	m.mu.Unlock()
+
+	roleFor := func(s Slot) string {
+		switch s {
+		case SlotPlanner:
+			return "A"
+		case SlotCoder:
+			return "B"
+		case SlotReviewer:
+			return "C"
+		}
+		return string(s)
+	}
+	gen := m.IsGenerating()
+
+	// Preserve deterministic order A, B, C.
+	ordered := []Slot{SlotPlanner, SlotCoder, SlotReviewer}
+	out := make([]SlotView, 0, len(ordered))
+	for _, s := range ordered {
+		cfg, ok := cfgs[s]
+		if !ok {
+			continue
+		}
+		v := SlotView{
+			Slot:       s,
+			RoleLabel:  roleFor(s),
+			ModelPath:  cfg.ModelPath,
+			ModelName:  filepath.Base(cfg.ModelPath),
+			CtxSize:    cfg.CtxSize,
+			KvCache:    cfg.KvCache,
+			Loaded:     s == active,
+			ListenPort: cfg.Port,
+			Generating: s == active && gen,
+		}
+		if p, has := pending[s]; has {
+			pCopy := p
+			v.PendingChanges = &pCopy
+		}
+		out = append(out, v)
+	}
+	return out
+}
+
 // SetSwapHook is called (from inside the manager mutex) whenever the active
 // slot changes. Keep the hook short and non-blocking.
 func (m *Manager) SetSwapHook(fn func(from, to Slot)) {
