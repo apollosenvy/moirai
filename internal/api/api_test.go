@@ -60,6 +60,26 @@ var _ = atomic.Bool{}
 // Ensure package import doesn't get flagged unused if we trim later.
 var _ = http.StatusOK
 
+// TestPatchSlotValidatesKvCache -- confirms validation paths.
+// Full test with real modelmgr swap deferred to Task 1.11 integration test.
+func TestPatchSlotValidatesKvCache(t *testing.T) {
+	if err := validatePatchBody(patchSlotBody{KvCache: "nonsense"}); err == nil {
+		t.Errorf("expected error for invalid kv_cache")
+	}
+	if err := validatePatchBody(patchSlotBody{KvCache: "turbo3"}); err != nil {
+		t.Errorf("unexpected error for valid kv_cache: %v", err)
+	}
+	if err := validatePatchBody(patchSlotBody{CtxSize: 1000}); err == nil {
+		t.Errorf("expected error for ctx_size too small")
+	}
+	if err := validatePatchBody(patchSlotBody{CtxSize: 8192}); err != nil {
+		t.Errorf("expected no error for valid ctx_size: %v", err)
+	}
+	if err := validatePatchBody(patchSlotBody{CtxSize: 8193}); err == nil {
+		t.Errorf("expected error for non-multiple-of-8192 ctx_size")
+	}
+}
+
 func TestModelsEndpointReturnsGGUFs(t *testing.T) {
 	dir := t.TempDir()
 	for _, name := range []string{"alpha.gguf", "beta.gguf", "skip.txt"} {

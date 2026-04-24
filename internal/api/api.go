@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -43,6 +45,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.HandleFunc("/ready", s.handleReady)
 	mux.HandleFunc("/slots", s.handleSlots)
+	mux.HandleFunc("/slots/", s.handleSlotsByID)
 	mux.HandleFunc("/models", s.handleModels)
 	mux.HandleFunc("/", s.handleUI)
 	return mux
@@ -54,6 +57,107 @@ func (s *Server) handleSlots(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, s.ModelMgr.SlotsView())
+}
+
+type patchSlotBody struct {
+	ModelPath string `json:"model_path,omitempty"`
+	CtxSize   int    `json:"ctx_size,omitempty"`
+	KvCache   string `json:"kv_cache,omitempty"`
+}
+
+var validKvValues = map[string]bool{
+	"":       true,
+	"f16":    true,
+	"q8_0":   true,
+	"q5_1":   true,
+	"q4_0":   true,
+	"turbo3": true,
+	"turbo4": true,
+}
+
+func validatePatchBody(b patchSlotBody) error {
+	if b.KvCache != "" && !validKvValues[b.KvCache] {
+		return fmt.Errorf("invalid kv_cache %q", b.KvCache)
+	}
+	if b.CtxSize != 0 {
+		if b.CtxSize < 8192 || b.CtxSize > 2097152 {
+			return fmt.Errorf("ctx_size out of range [8192, 2097152]: %d", b.CtxSize)
+		}
+		if b.CtxSize%8192 != 0 {
+			return fmt.Errorf("ctx_size must be multiple of 8192")
+		}
+	}
+	if b.ModelPath != "" {
+		if !strings.HasSuffix(b.ModelPath, ".gguf") {
+			return fmt.Errorf("model_path must end in .gguf")
+		}
+		if _, err := os.Stat(b.ModelPath); err != nil {
+			return fmt.Errorf("model_path not found: %v", err)
+		}
+	}
+	return nil
+}
+
+func (s *Server) handleSlotsByID(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPatch {
+		writeJSON(w, 405, map[string]string{"error": "PATCH required"})
+		return
+	}
+	slotName := strings.TrimPrefix(r.URL.Path, "/slots/")
+	if slotName == "" || strings.Contains(slotName, "/") {
+		writeJSON(w, 400, map[string]string{"error": "invalid slot"})
+		return
+	}
+	slot := modelmgr.Slot(slotName)
+	// Validate slot exists.
+	found := false
+	views := s.ModelMgr.SlotsView()
+	var this modelmgr.SlotView
+	for _, v := range views {
+		if v.Slot == slot {
+			found = true
+			this = v
+			break
+		}
+	}
+	if !found {
+		writeJSON(w, 404, map[string]string{"error": "unknown slot"})
+		return
+	}
+
+	var body patchSlotBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, 400, map[string]string{"error": err.Error()})
+		return
+	}
+	if err := validatePatchBody(body); err != nil {
+		writeJSON(w, 400, map[string]string{"error": err.Error()})
+		return
+	}
+
+	pending := modelmgr.PendingChanges{
+		ModelPath: body.ModelPath,
+		CtxSize:   body.CtxSize,
+		KvCache:   body.KvCache,
+	}
+
+	if !this.Loaded {
+		// Cold slot -- apply to config immediately, no restart needed.
+		s.ModelMgr.SetPending(slot, pending)
+		s.ModelMgr.ApplyPending(slot)
+		writeJSON(w, 200, map[string]any{"applied": true, "pending": false, "reason": "ok"})
+		return
+	}
+	if this.Generating {
+		// Busy -- queue.
+		s.ModelMgr.SetPending(slot, pending)
+		writeJSON(w, 200, map[string]any{"applied": false, "pending": true, "reason": "busy"})
+		return
+	}
+	// Loaded but idle -- queue until the next natural swap. See DEVIATION in
+	// the commit message / SPEC_DEVIATIONS.md for the reasoning.
+	s.ModelMgr.SetPending(slot, pending)
+	writeJSON(w, 200, map[string]any{"applied": false, "pending": true, "reason": "queued-for-next-swap"})
 }
 
 func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {

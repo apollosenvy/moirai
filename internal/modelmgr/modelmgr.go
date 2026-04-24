@@ -149,6 +149,9 @@ func (m *Manager) ClearPending(slot Slot) {
 // TODO: persist the updated ModelConfig back to the daemon config file so
 // the change survives a restart. For now, applied changes live only in
 // memory for the lifetime of the process.
+//
+// TODO(config-persist): write m.cfg.Models back to ~/.config/agent-router/config.json
+// so user-applied slot changes survive daemon restart. Not needed for initial ship.
 func (m *Manager) ApplyPending(slot Slot) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
