@@ -258,7 +258,7 @@ func TestStartClosesParentLogFile(t *testing.T) {
 	cfg := m.cfg.Models[SlotPlanner]
 
 	before := countOpenFDs(t)
-	if err := m.start(context.Background(), SlotPlanner, cfg); err != nil {
+	if err := m.start(context.Background(), SlotPlanner, &cfg); err != nil {
 		t.Fatalf("start: %v", err)
 	}
 	t.Cleanup(func() { _ = m.stop() })
@@ -309,7 +309,7 @@ func TestWaitReadyFailureReapsChild(t *testing.T) {
 	}
 
 	cfg := m.cfg.Models[SlotPlanner]
-	err = m.start(context.Background(), SlotPlanner, cfg)
+	err = m.start(context.Background(), SlotPlanner, &cfg)
 	if err == nil {
 		t.Fatalf("expected start() to fail because /usr/bin/true never listens")
 	}

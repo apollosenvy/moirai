@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -390,17 +391,37 @@ func (m *Manager) EnsureSlot(ctx context.Context, slot Slot) (string, error) {
 		return "", err
 	}
 
-	if err := m.start(ctx, slot, cfg); err != nil {
+	if err := m.start(ctx, slot, &cfg); err != nil {
 		return "", err
 	}
 
 	m.mu.Lock()
 	hook := m.onSwap
+	port := m.port
 	m.mu.Unlock()
 	if hook != nil {
 		hook(from, slot)
 	}
-	return fmt.Sprintf("http://127.0.0.1:%d", cfg.Port), nil
+	return fmt.Sprintf("http://127.0.0.1:%d", port), nil
+}
+
+// pickFreePort asks the kernel for a free TCP port on 127.0.0.1 by binding
+// to :0, reading the assigned port, and closing the socket. The closed-then-
+// rebind window is a tiny TOCTOU race; for a local single-user daemon this
+// is acceptable and an order of magnitude better than hardcoded 8001/8002/
+// 8003 colliding with other services on Gary's box (engram-embed-sv at
+// :8011 broke an A/B run before this fix).
+func pickFreePort() (int, error) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return 0, fmt.Errorf("modelmgr: pick free port: %w", err)
+	}
+	defer l.Close()
+	addr, ok := l.Addr().(*net.TCPAddr)
+	if !ok {
+		return 0, fmt.Errorf("modelmgr: pick free port: listener returned non-TCP addr %T", l.Addr())
+	}
+	return addr.Port, nil
 }
 
 func buildLlamaArgs(cfg ModelConfig) []string {
@@ -441,8 +462,21 @@ func buildLlamaArgs(cfg ModelConfig) []string {
 	return args
 }
 
-func (m *Manager) start(ctx context.Context, slot Slot, cfg ModelConfig) error {
-	args := buildLlamaArgs(cfg)
+func (m *Manager) start(ctx context.Context, slot Slot, cfg *ModelConfig) error {
+	// Dynamic port selection: when cfg.Port is unset (or the explicit
+	// sentinel 0), ask the kernel for a free 127.0.0.1 port instead of
+	// using a hardcoded value. Hardcoded slot ports collided with
+	// engram-embed-sv on :8011 in production, hanging the swap with
+	// `couldn't bind HTTP server socket`. cfg is *ModelConfig so the
+	// chosen port is visible to the caller via m.port set below.
+	if cfg.Port == 0 {
+		p, err := pickFreePort()
+		if err != nil {
+			return err
+		}
+		cfg.Port = p
+	}
+	args := buildLlamaArgs(*cfg)
 
 	logPath := filepath.Join(m.cfg.LogDir, fmt.Sprintf("llama-%s.log", slot))
 	// SEC-PASS5-005: 0o600 daemon log; llama-server stdout/stderr can echo

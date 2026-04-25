@@ -58,7 +58,7 @@ func TestStartClosesLogFileOnWaitReadyFailure(t *testing.T) {
 	for i := 0; i < rounds; i++ {
 		// Short per-call timeout so start()'s reap path fires quickly.
 		ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
-		err := m.start(ctx, SlotPlanner, cfg)
+		err := m.start(ctx, SlotPlanner, &cfg)
 		cancel()
 		if err == nil {
 			t.Fatalf("expected waitReady failure, got nil")
