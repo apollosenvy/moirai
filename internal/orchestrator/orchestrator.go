@@ -1003,10 +1003,21 @@ func (o *Orchestrator) roLoop(ctx context.Context, st *runState, tb *toolbox.Too
 			// Auto-compaction: if the result is large, emit it as a Pensive
 			// atom and replace it in RO's conversation with a short stub.
 			// Protects RO's attention window from bloating as the task grows.
-			// Compaction is skipped for tools that should never bloat
-			// (done/fail are terminal; pensive.search is already a retrieval
-			// so compacting it defeats the purpose).
-			compactable := call.Name != "pensive.search" && call.Name != "pensive.emit_atom"
+			// Compaction is skipped for tools that should never bloat:
+			// - pensive.search / pensive.emit_atom: already retrievals
+			// - ask_planner / ask_coder: their output is the substrate the
+			//   reviewer reasons over. Rematch #9 traces show a 52 KB
+			//   ask_planner reply being compacted to a 393-byte stub; the
+			//   reviewer then panicked and burned its pensive.search budget
+			//   trying to find "the plan" that no longer existed in
+			//   conversation context. Auto-extract for ask_coder also
+			//   handles the file-emission half of its output, so the
+			//   reviewer only needs the prose summary, but the prose IS the
+			//   reasoning trail and is itself often >4 KB.
+			compactable := call.Name != "pensive.search" &&
+				call.Name != "pensive.emit_atom" &&
+				call.Name != "ask_planner" &&
+				call.Name != "ask_coder"
 			if compactable && o.cfg.CompactThresholdBytes > 0 && len(result) > o.cfg.CompactThresholdBytes {
 				stub, emitErr := o.compactLargeResult(ctx, st, call, result)
 				if emitErr == nil {
