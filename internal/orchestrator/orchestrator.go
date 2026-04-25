@@ -728,8 +728,20 @@ func (o *Orchestrator) roLoop(ctx context.Context, st *runState, tb *toolbox.Too
 	}
 	tr.Emit(trace.KindSwap, map[string]any{"to": "reviewer", "reason": "ro_loop"})
 
+	// One-shot format primer: a synthetic prior exchange that demonstrates
+	// the exact envelope the parser expects. Reasoning models (Ministral,
+	// Gemma-4, Qwen-distill) tend to drift from the natural-language spec
+	// in the system prompt; showing them ONE successful turn pins the
+	// format and dramatically reduces no_tool_call nudges in early turns.
+	// The synthetic task is a no-op (a hello task with a fake "ok" verdict)
+	// so it cannot leak into the real plan; the model just sees the shape.
 	messages := []modelmgr.ChatMessage{
 		{Role: "system", Content: roSystemPrompt()},
+		{Role: "user", Content: "Task:\nWrite a hello-world script.\n\nRepo root: /tmp/example\nBranch: example/demo\n\nBegin. Think about what to do first, then emit a single tool call wrapped in <TOOL>...</TOOL>."},
+		{Role: "assistant", Content: `Hello-world is small enough that I can dispatch the coder directly without a planner round. I will instruct the coder to produce a single Python script.
+
+<TOOL>{"name": "ask_coder", "args": {"instruction": "Write a Python script src/hello.py that prints \"hello\"."}}</TOOL>`},
+		{Role: "user", Content: "<RESULT>(example exchange ends here -- the real task follows)</RESULT>"},
 		{Role: "user", Content: fmt.Sprintf(
 			"Task:\n%s\n\nRepo root: %s\nBranch: %s\n\nBegin. Think about what to do first, then emit a single tool call wrapped in <TOOL>...</TOOL>.",
 			t.Description, t.RepoRoot, t.Branch,
@@ -1547,6 +1559,38 @@ RETRY MODE (your previous code caused a test failure):
 func roSystemPrompt() string {
 	return `You are the Reviewer-Orchestrator.
 You coordinate the Planner (P) and the Coder (C) to complete the user's task.
+
+OUTPUT FORMAT (read carefully)
+
+Each reply MUST contain EXACTLY one tool call wrapped in <TOOL>...</TOOL>
+tags. The PREFERRED form is a single JSON object inside the tags with
+"name" and "args" fields:
+
+  I will start by asking the planner for a build plan.
+  <TOOL>{"name": "ask_planner", "args": {"instruction": "Lay out a 5-step plan for the task."}}</TOOL>
+
+The parser also accepts the bareword-shorthand form (use it if your model
+emits this naturally; do not switch styles mid-task):
+
+  <TOOL>ask_planner {"instruction": "Lay out a 5-step plan for the task."}</TOOL>
+
+Hard rules:
+
+  - The <TOOL> and </TOOL> tags are REQUIRED. JSON outside the tags is
+    ignored. A bare JSON object with no tags is only accepted if it is
+    the FIRST non-whitespace character of your reply.
+  - Exactly ONE <TOOL> block per reply. Two or more blocks are rejected
+    as ambiguous; the daemon will nudge you to retry with one.
+  - The args object must be valid JSON (double-quoted strings, no
+    trailing commas).
+  - Think in prose BEFORE the tool call, not after. The parser scans
+    from the front and does not accept tool calls embedded mid-prose
+    if they are not the dominant content.
+
+If a reply is rejected you will receive a nudge:
+"No tool call detected. ..." Re-emit the SAME intended call in the
+preferred form above. Do not switch tools or strategy on a parse error;
+the only fix is the envelope.
 
 Your tools (emit exactly one per turn, wrapped in <TOOL>...</TOOL>):
   ask_planner      args: {"instruction": "..."}
