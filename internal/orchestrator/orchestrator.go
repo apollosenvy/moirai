@@ -35,12 +35,14 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aegis/agent-router/internal/aegis"
@@ -49,6 +51,20 @@ import (
 	"github.com/aegis/agent-router/internal/taskstore"
 	"github.com/aegis/agent-router/internal/toolbox"
 	"github.com/aegis/agent-router/internal/trace"
+)
+
+// Sentinel errors surfaced by Submit and Abort. The HTTP layer maps these to
+// client-fault status codes (400 for invalid input, 404 for not found). Keep
+// the set small and well-defined; the callers pattern-match via errors.Is.
+var (
+	// ErrInvalidInput is returned by Submit for caller-supplied data that is
+	// malformed, missing, or references a non-existent path. It maps to
+	// HTTP 400.
+	ErrInvalidInput = errors.New("invalid input")
+	// ErrTaskNotFound is returned by Abort / Inspect / Interrupt / Inject
+	// when the caller references a task id the orchestrator does not know
+	// about. It maps to HTTP 404.
+	ErrTaskNotFound = errors.New("task not found")
 )
 
 // --- shared budgets --------------------------------------------------------
@@ -70,8 +86,18 @@ const (
 	DefaultCompactThresholdBytes = 4096
 )
 
+// ModelManager is the subset of *modelmgr.Manager the orchestrator needs.
+// Defining it as an interface lets tests swap in a lightweight stub without
+// spawning a real llama-server. The concrete *modelmgr.Manager already
+// satisfies this surface.
+type ModelManager interface {
+	EnsureSlot(ctx context.Context, slot modelmgr.Slot) (string, error)
+	Active() modelmgr.Slot
+	Complete(ctx context.Context, req modelmgr.ChatRequest) (string, error)
+}
+
 type Config struct {
-	ModelMgr         *modelmgr.Manager
+	ModelMgr         ModelManager
 	Store            *taskstore.Store
 	L2               *aegis.L2
 	DefaultRepo      string
@@ -120,6 +146,14 @@ type runState struct {
 	task   *taskstore.Task
 	trace  *trace.Writer
 
+	// abortRequested is flipped to true by Abort() before it cancels the
+	// run ctx. The run goroutine's defer checks this flag to decide
+	// between StatusAborted (operator-driven) and StatusFailed (ctx
+	// cancelled for another reason, e.g. budget timeout). Writes to
+	// task.Status live exclusively on the run goroutine's path, which
+	// eliminates the race Abort() used to cause.
+	abortRequested atomic.Bool
+
 	// Tool budget counters.
 	askCoderCalls    int
 	askPlannerCalls  int
@@ -131,9 +165,27 @@ type runState struct {
 	// Flag: has a test.run failed since the last ask_coder? If so, the next
 	// ask_coder should get fs.read + fs.search access.
 	lastTestFailed bool
+
+	// User-injected guidance queued for the next RO turn. The RO loop
+	// drains this at the top of each iteration, splices entries in as
+	// user-role messages, then clears the queue. Protected by injectMu
+	// so the /inject API endpoint can append from a different goroutine
+	// without racing the RO loop's read.
+	injectMu      sync.Mutex
+	pendingInject []string
 }
 
-func New(cfg Config) *Orchestrator {
+// New validates cfg and builds an Orchestrator. Store and ModelMgr are
+// required; passing either as nil returns an error instead of deferring the
+// SIGSEGV into a spawned run goroutine. Defaults fill in zero-valued budget
+// knobs.
+func New(cfg Config) (*Orchestrator, error) {
+	if cfg.Store == nil {
+		return nil, fmt.Errorf("orchestrator: Store is required")
+	}
+	if cfg.ModelMgr == nil {
+		return nil, fmt.Errorf("orchestrator: ModelMgr is required")
+	}
 	if cfg.MaxROTurns == 0 {
 		cfg.MaxROTurns = DefaultMaxROTurns
 	}
@@ -154,24 +206,40 @@ func New(cfg Config) *Orchestrator {
 	return &Orchestrator{
 		cfg:     cfg,
 		running: make(map[string]*runState),
-	}
+	}, nil
 }
 
 // Submit enqueues a new task. The returned task id is durable across daemon
 // restarts.
+//
+// The returned *taskstore.Task is a deep-copied snapshot, NOT the live
+// struct. The live struct is handed to the run goroutine via runState.task
+// and is mutated concurrently (Status/LastError/UpdatedAt at minimum). Any
+// HTTP serialisation of the returned pointer therefore sees a stable value
+// and does not race the run goroutine's writes. See Task.Clone.
+//
+// Caller-fault errors (empty description, missing repo, bad path) wrap
+// ErrInvalidInput so HTTP callers can map them to 400 via errors.Is.
 func (o *Orchestrator) Submit(ctx context.Context, description, repoRoot string) (*taskstore.Task, error) {
+	if strings.TrimSpace(description) == "" {
+		return nil, fmt.Errorf("%w: description required", ErrInvalidInput)
+	}
 	if repoRoot == "" {
 		repoRoot = o.cfg.DefaultRepo
 	}
 	if repoRoot == "" {
-		return nil, fmt.Errorf("orchestrator: no repo root")
+		return nil, fmt.Errorf("%w: no repo root", ErrInvalidInput)
 	}
-	abs, err := filepath.Abs(repoRoot)
+	expanded, err := expandUserPath(repoRoot)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: repo root: %v", ErrInvalidInput, err)
+	}
+	abs, err := filepath.Abs(expanded)
+	if err != nil {
+		return nil, fmt.Errorf("%w: repo root: %v", ErrInvalidInput, err)
 	}
 	if _, err := os.Stat(abs); err != nil {
-		return nil, fmt.Errorf("orchestrator: repo root: %w", err)
+		return nil, fmt.Errorf("%w: repo root: %v", ErrInvalidInput, err)
 	}
 
 	id := newTaskID()
@@ -201,11 +269,24 @@ func (o *Orchestrator) Submit(ctx context.Context, description, repoRoot string)
 	o.running[id] = st
 	o.mu.Unlock()
 
+	// Snapshot BEFORE launching the run goroutine: the goroutine owns all
+	// further writes to t, so taking the clone here is race-free. Returning
+	// the live pointer would let an HTTP response encoder read Status at the
+	// same instant the run goroutine wrote it.
+	snapshot := t.Clone()
+
 	go o.run(runCtx, st)
-	return t, nil
+	return snapshot, nil
 }
 
 // Abort stops a running task cleanly. State persists for postmortem.
+//
+// Abort is intentionally write-light: it flips st.abortRequested so the run
+// goroutine's defer can finalise StatusAborted, then cancels the run ctx.
+// It does NOT touch st.task.Status, call Save(), or close the trace writer --
+// the run goroutine is the sole writer of those fields, and doing any of that
+// here would race the in-flight loop. If the task is not currently tracked in
+// o.running (daemon restarted, etc.) we mark the persisted record directly.
 func (o *Orchestrator) Abort(id string) error {
 	o.mu.Lock()
 	st, ok := o.running[id]
@@ -213,6 +294,11 @@ func (o *Orchestrator) Abort(id string) error {
 	if !ok {
 		t, err := o.cfg.Store.Load(id)
 		if err != nil {
+			// Persisted record doesn't exist either -- surface the not-found
+			// sentinel so the HTTP layer can return 404.
+			if os.IsNotExist(err) {
+				return fmt.Errorf("%w: %s", ErrTaskNotFound, id)
+			}
 			return err
 		}
 		if t.Status == taskstore.StatusRunning {
@@ -221,15 +307,54 @@ func (o *Orchestrator) Abort(id string) error {
 		}
 		return nil
 	}
-	st.cancel()
-	st.task.Status = taskstore.StatusAborted
-	_ = o.cfg.Store.Save(st.task)
+	st.abortRequested.Store(true)
 	st.trace.Emit(trace.KindInfo, map[string]any{"message": "aborted by user"})
-	_ = st.trace.Close()
-	o.mu.Lock()
-	delete(o.running, id)
-	o.mu.Unlock()
+	st.cancel()
 	return nil
+}
+
+// Inject queues a user-authored guidance message for the named running
+// task. The RO loop picks it up at the top of its next turn, splicing
+// it in as a user-role message so the reviewer sees it before deciding
+// the next tool call. Returns an error if the task isn't currently
+// running (inject only makes sense for in-flight tasks; aborted /
+// finished tasks have nowhere for the message to go).
+//
+// This is the "steer without restarting" lever: pair with the Phos UI
+// composer to nudge a model that's loop-stuck without blowing away its
+// context. Safe to call concurrently; the per-task injectMu serializes
+// writes against the RO loop's drain.
+func (o *Orchestrator) Inject(taskID, message string) error {
+	message = strings.TrimSpace(message)
+	if message == "" {
+		return fmt.Errorf("inject: empty message")
+	}
+	o.mu.Lock()
+	st, ok := o.running[taskID]
+	o.mu.Unlock()
+	if !ok {
+		return fmt.Errorf("inject: task %s not running", taskID)
+	}
+	st.injectMu.Lock()
+	st.pendingInject = append(st.pendingInject, message)
+	depth := len(st.pendingInject)
+	st.injectMu.Unlock()
+	st.trace.Emit(trace.KindInfo, map[string]any{
+		"inject":    shorten(message, 200),
+		"queue_len": depth,
+	})
+	return nil
+}
+
+// Interrupt is a soft interrupt: it queues a user message that tells the
+// RO its current line of reasoning is being cut off and asks it to
+// reconsider. Unlike Abort, the task keeps running; unlike Inject, the
+// message is fixed rather than user-authored. Useful when the reviewer
+// is clearly stuck in a no_tool_call loop and needs a hard reset.
+func (o *Orchestrator) Interrupt(taskID string) error {
+	return o.Inject(taskID, "USER INTERRUPT: stop your current line of reasoning. "+
+		"Re-read the task description and emit your next tool call immediately. "+
+		"Do not produce additional prose before the tool wrapper.")
 }
 
 // InspectResult holds a task record plus its recent trace events.
@@ -243,10 +368,9 @@ func (o *Orchestrator) Inspect(id string) (*InspectResult, error) {
 	if err != nil {
 		return nil, err
 	}
-	events, _ := trace.ReadAll(id)
-	if len(events) > 20 {
-		events = events[len(events)-20:]
-	}
+	// ReadTail seeks from EOF; avoids re-reading the entire trace jsonl on
+	// every poll as long-running tasks accumulate thousands of events.
+	events, _ := trace.ReadTail(id, 20)
 	return &InspectResult{Task: t, Recent: events}, nil
 }
 
@@ -270,7 +394,7 @@ func (o *Orchestrator) run(ctx context.Context, st *runState) {
 	// Load repo config.
 	rcfg, hadCfg, err := repoconfig.Load(t.RepoRoot)
 	if err != nil {
-		o.fail(t, tr, fmt.Errorf("load repo config: %w", err))
+		o.fail(st, t, tr, fmt.Errorf("load repo config: %w", err))
 		return
 	}
 	tr.Emit(trace.KindInfo, map[string]any{
@@ -288,13 +412,22 @@ func (o *Orchestrator) run(ctx context.Context, st *runState) {
 
 	tb, err := toolbox.New(t.RepoRoot, t.Branch, o.cfg.ScratchDir, rcfg, false)
 	if err != nil {
-		o.fail(t, tr, fmt.Errorf("toolbox: %w", err))
+		o.fail(st, t, tr, fmt.Errorf("toolbox: %w", err))
+		return
+	}
+
+	// Fresh project escape hatch: if the user pointed us at a directory
+	// that has never been git-initialized, do the ritual ourselves so the
+	// submit form doesn't need "cd && git init && commit" as a prereq.
+	// No-op if repo_root is already a git repo.
+	if err := tb.EnsureRepo(ctx); err != nil {
+		o.fail(st, t, tr, fmt.Errorf("git init: %w", err))
 		return
 	}
 
 	// Check out working branch.
 	if err := tb.GitCheckoutBranch(ctx); err != nil {
-		o.fail(t, tr, fmt.Errorf("git checkout: %w", err))
+		o.fail(st, t, tr, fmt.Errorf("git checkout: %w", err))
 		return
 	}
 	tr.Emit(trace.KindInfo, map[string]any{"branch": t.Branch})
@@ -307,11 +440,11 @@ func (o *Orchestrator) run(ctx context.Context, st *runState) {
 
 	summary, ok, err := o.roLoop(ctx, st, tb)
 	if err != nil {
-		o.fail(t, tr, err)
+		o.fail(st, t, tr, err)
 		return
 	}
 	if !ok {
-		o.fail(t, tr, fmt.Errorf("ro loop terminated without success: %s", summary))
+		o.fail(st, t, tr, fmt.Errorf("ro loop terminated without success: %s", summary))
 		return
 	}
 
@@ -367,6 +500,28 @@ func (o *Orchestrator) roLoop(ctx context.Context, st *runState, tb *toolbox.Too
 		}
 		st.roTurns++
 
+		// Drain any user-injected guidance into the message stream before
+		// this turn's LLM call. Each pending entry becomes a user-role
+		// message tagged with USER INJECT so the reviewer can distinguish
+		// operator steering from orchestrator nudges.
+		st.injectMu.Lock()
+		if n := len(st.pendingInject); n > 0 {
+			for _, m := range st.pendingInject {
+				messages = append(messages, modelmgr.ChatMessage{
+					Role:    "user",
+					Content: "[USER INJECT] " + m,
+				})
+			}
+			st.pendingInject = st.pendingInject[:0]
+			st.injectMu.Unlock()
+			tr.Emit(trace.KindInfo, map[string]any{
+				"inject_drained": n,
+				"turn":           st.roTurns,
+			})
+		} else {
+			st.injectMu.Unlock()
+		}
+
 		// Ensure reviewer still loaded (ask_planner / ask_coder swap it).
 		if o.cfg.ModelMgr.Active() != modelmgr.SlotReviewer {
 			if _, err := o.cfg.ModelMgr.EnsureSlot(ctx, modelmgr.SlotReviewer); err != nil {
@@ -387,16 +542,37 @@ func (o *Orchestrator) roLoop(ctx context.Context, st *runState, tb *toolbox.Too
 			"role":  "reviewer",
 			"turn":  st.roTurns,
 			"bytes": len(resp),
+			"head":  shorten(resp, 400),
 		})
-		messages = append(messages, modelmgr.ChatMessage{Role: "assistant", Content: resp})
 
 		call, ok := extractToolCall(resp)
+
+		// RO-prose-bloat guard: if RO emitted no tool call AND the response is
+		// large (>8 KB), truncate it before appending to messages. Unbounded
+		// assistant-role prose grew the Observatory run from 40 KB to 131 KB
+		// context in 4 turns because Gemma kept re-explaining the same
+		// misunderstood fs.write result. We keep a head+tail summary so the
+		// RO can still see what it said without burning context on the body.
+		assistantContent := resp
+		if !ok && len(resp) > 8192 {
+			head := shorten(resp[:4096], 4096)
+			tail := resp[len(resp)-1024:]
+			assistantContent = fmt.Sprintf("%s\n...[truncated %d bytes of no-tool-call prose]...\n%s",
+				head, len(resp)-5120, tail)
+		}
+		messages = append(messages, modelmgr.ChatMessage{Role: "assistant", Content: assistantContent})
+
 		if !ok {
 			// Nudge once, then give up.
 			if st.roTurns < o.cfg.MaxROTurns {
+				nudge := "No tool call detected. Emit exactly one call wrapped in <TOOL>...</TOOL>. " +
+					"Both strict form <TOOL>{\"name\":\"X\",\"args\":{...}}</TOOL> and shorthand " +
+					"<TOOL>X args: {...}</TOOL> are accepted. If the last action already succeeded " +
+					"(fs.write returns \"OK wrote N bytes ...\"), proceed to the next step; do not " +
+					"re-attempt. Skip prose; emit the tool call now."
 				messages = append(messages, modelmgr.ChatMessage{
 					Role:    "user",
-					Content: "No tool call detected. Emit exactly one call wrapped in <TOOL>{\"name\":\"...\",\"args\":{...}}</TOOL>.",
+					Content: nudge,
 				})
 				tr.Emit(trace.KindInfo, map[string]any{"ro_nudge": "no_tool_call", "turn": st.roTurns})
 				continue
@@ -580,7 +756,17 @@ func (o *Orchestrator) executeROTool(ctx context.Context, st *runState, tb *tool
 		if err != nil {
 			return "", err
 		}
-		return fmt.Sprintf("wrote %d bytes to %s (created=%v)", res.Bytes, res.Path, res.Created), nil
+		// The result string is what the RO reads as the tool return. Historical
+		// form used `created=%v` which reasoning models misread as failure when
+		// overwriting an existing file (the observed loop was Gemma-4-A4B
+		// re-emitting a 64KB "the file wasn't created, try again" prose chain
+		// for 4+ turns, bloating context until it overflowed 131k). Now we
+		// surface an unambiguous status: OK with either "new" or "overwritten".
+		what := "new"
+		if !res.Created {
+			what = "overwritten"
+		}
+		return fmt.Sprintf("OK wrote %d bytes to %s (%s)", res.Bytes, res.Path, what), nil
 
 	case "fs.search":
 		path := argStr("path_glob")
@@ -725,6 +911,7 @@ func (o *Orchestrator) callPlanner(ctx context.Context, st *runState, tb *toolbo
 			"kind":  "p_reply",
 			"turn":  i,
 			"bytes": len(resp),
+			"head":  shorten(resp, 400),
 		})
 		if call, ok := extractToolCall(resp); ok {
 			// Only fs.write is permitted to the planner.
@@ -784,7 +971,6 @@ func (o *Orchestrator) callCoder(ctx context.Context, st *runState, tb *toolbox.
 		maxTurns = 6 // allow fs.read / fs.search interleaved with final code
 	}
 
-	var final string
 	for i := 0; i < maxTurns; i++ {
 		resp, err := o.cfg.ModelMgr.Complete(ctx, modelmgr.ChatRequest{
 			Messages:    messages,
@@ -799,6 +985,7 @@ func (o *Orchestrator) callCoder(ctx context.Context, st *runState, tb *toolbox.
 			"kind":  "c_reply",
 			"turn":  i,
 			"bytes": len(resp),
+			"head":  shorten(resp, 400),
 		})
 		messages = append(messages, modelmgr.ChatMessage{Role: "assistant", Content: resp})
 
@@ -862,13 +1049,22 @@ func (o *Orchestrator) callCoder(ctx context.Context, st *runState, tb *toolbox.
 			return resp, nil
 		}
 	}
-	if final == "" {
-		final = "(coder exhausted retry-mode inner turns without producing final code)"
-	}
-	return final, nil
+	return "(coder exhausted retry-mode inner turns without producing final code)", nil
 }
 
-func (o *Orchestrator) fail(t *taskstore.Task, tr *trace.Writer, err error) {
+// fail finalises a run as failed and persists the error. If the run state
+// indicates an operator abort (abortRequested set and the error came from
+// ctx cancellation), the task is marked StatusAborted instead -- the run
+// goroutine is the sole writer of Status, so this decision happens here
+// rather than in Abort() to avoid racing the in-flight loop.
+func (o *Orchestrator) fail(st *runState, t *taskstore.Task, tr *trace.Writer, err error) {
+	if st != nil && st.abortRequested.Load() {
+		t.Status = taskstore.StatusAborted
+		t.LastError = err.Error()
+		_ = o.cfg.Store.Save(t)
+		tr.Emit(trace.KindInfo, map[string]any{"aborted_by_user": true, "reason": err.Error()})
+		return
+	}
 	t.Status = taskstore.StatusFailed
 	t.LastError = err.Error()
 	_ = o.cfg.Store.Save(t)
@@ -1011,11 +1207,47 @@ var (
 	toolREOpen   = regexp.MustCompile(`(?s)<TOOL>\s*(\{.*?\})\s*<TOOL>`)
 	toolREStart  = regexp.MustCompile(`(?s)<TOOL>\s*(\{.*?\})\s*$`)
 
+	// Shorthand form some reasoning models (Gemma-4-A4B-IQ4_XS observed
+	// running the Observatory task) emit instead of the strict JSON form:
+	//   <TOOL>ask_coder args: {"instruction": "..."}</TOOL>
+	// The model treats the prompt's example as pseudo-syntax rather than
+	// literal JSON. Rejecting this was costing us 30+ nudge turns before
+	// ctx overflow. The capture is (name, args_json) which we stitch back
+	// into a proper toolCall in extractToolCall.
+	// `[\w.]+` so `pensive.search` / `fs.write` / `test.run` all match.
+	toolREShorthand       = regexp.MustCompile(`(?s)<TOOL>\s*([\w.]+)\s+args\s*:\s*(\{.*?\})\s*</TOOL>`)
+	toolREShorthandOpen   = regexp.MustCompile(`(?s)<TOOL>\s*([\w.]+)\s+args\s*:\s*(\{.*?\})\s*<TOOL>`)
+
 	toolTagClose = regexp.MustCompile(`(?s)<TOOL>.*?</TOOL>`)
 	toolTagOpen  = regexp.MustCompile(`(?s)<TOOL>.*?<TOOL>`)
 )
 
 func extractToolCall(s string) (toolCall, bool) {
+	// Shorthand form: <TOOL>name args: {...}</TOOL>. Check these FIRST so a
+	// well-formed shorthand wins over the last-resort bare-JSON scan below.
+	for _, re := range []*regexp.Regexp{toolREShorthand, toolREShorthandOpen} {
+		m := re.FindStringSubmatch(s)
+		if m == nil {
+			continue
+		}
+		name := m[1]
+		argsJSON := m[2]
+		var args map[string]any
+		if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
+			if cleaned, ok := balancedObject(argsJSON); ok {
+				if err := json.Unmarshal([]byte(cleaned), &args); err != nil {
+					continue
+				}
+			} else {
+				continue
+			}
+		}
+		if args == nil {
+			args = map[string]any{}
+		}
+		return toolCall{Name: name, Args: args}, true
+	}
+
 	for _, re := range []*regexp.Regexp{toolREClosed, toolREOpen, toolREStart} {
 		m := re.FindStringSubmatch(s)
 		if m == nil {

@@ -212,6 +212,59 @@ func (t *Toolbox) GitBranch(ctx context.Context) (string, error) {
 	return strings.TrimSpace(out), err
 }
 
+// EnsureRepo guarantees RepoRoot is a git repository. If it already is,
+// no-op. If not, runs `git init` + commits any existing files as an
+// initial snapshot so subsequent `git checkout -b` has a base to branch
+// from. Idempotent.
+//
+// This is the "fresh project, no git yet" escape hatch. It matches what
+// users expect when they hand the agent an empty or never-versioned
+// directory: do the init ritual for them, don't make them context-switch
+// to a terminal before submitting a task. Matches Forge's behavior so
+// A/B comparisons between the two agent systems start from parity
+// instead of a "did you remember to git init" stumble.
+//
+// An identity is configured at the local-repo level only if the user has
+// no global identity, so we don't stomp on existing git config. The
+// synthesized identity ("agent-router@localhost") makes the initial
+// commit possible; real commits from the agent later still use the
+// user's global identity if they set one afterward.
+func (t *Toolbox) EnsureRepo(ctx context.Context) error {
+	if _, _, code, err := t.git(ctx, "rev-parse", "--git-dir"); err == nil && code == 0 {
+		return nil
+	}
+
+	if _, errStr, code, err := t.git(ctx, "init"); err != nil {
+		return err
+	} else if code != 0 {
+		return fmt.Errorf("git init: %s", errStr)
+	}
+
+	// Seed identity only if neither env vars nor global config provide one.
+	// `git config --get` returns code 1 when the key is unset.
+	if _, _, code, _ := t.git(ctx, "config", "user.email"); code != 0 {
+		_, _, _, _ = t.git(ctx, "config", "user.email", "agent-router@localhost")
+	}
+	if _, _, code, _ := t.git(ctx, "config", "user.name"); code != 0 {
+		_, _, _, _ = t.git(ctx, "config", "user.name", "agent-router")
+	}
+
+	// Stage everything that's already there (including .gitignore if any)
+	// and make the root commit. --allow-empty so an empty directory still
+	// becomes a valid repo with HEAD pointing somewhere.
+	if _, errStr, code, err := t.git(ctx, "add", "-A"); err != nil {
+		return err
+	} else if code != 0 {
+		return fmt.Errorf("git add (init): %s", errStr)
+	}
+	if _, errStr, code, err := t.git(ctx, "commit", "--allow-empty", "-m", "agent-router: initial snapshot"); err != nil {
+		return err
+	} else if code != 0 {
+		return fmt.Errorf("git commit (init): %s", errStr)
+	}
+	return nil
+}
+
 // GitCheckoutBranch creates the agent working branch if missing, then checks
 // it out. Leaves any uncommitted changes as-is (they carry onto the branch).
 func (t *Toolbox) GitCheckoutBranch(ctx context.Context) error {

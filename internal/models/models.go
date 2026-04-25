@@ -5,9 +5,7 @@
 package models
 
 import (
-	"encoding/binary"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -50,43 +48,14 @@ func ListGGUF(dir string) ([]Info, error) {
 			Name:      strings.TrimSuffix(e.Name(), ".gguf"),
 			SizeBytes: stat.Size(),
 		}
-		// Best-effort: try to read head_dim from GGUF metadata.
-		if hd := tryReadHeadDim(full); hd > 0 {
-			info.HeadDim = hd
-		}
-		info.TurboquantSafe = info.HeadDim != 128 // known bug: head_dim=128 + turbo3/4 = garbage
+		// head_dim parsing is not implemented; GGUF KV metadata parsing is
+		// out of scope for this package. Until it lands, we assume every
+		// enumerated model is turboquant-safe. Known-bad head_dim=128 models
+		// are rejected via explicit manifest, not via this enumerator.
+		info.TurboquantSafe = info.HeadDim != 128
 		out = append(out, info)
 	}
 	return out, nil
-}
-
-// tryReadHeadDim reads just the GGUF magic header to confirm it's a GGUF file.
-// Full metadata parsing is more code than this task needs; return 0 for now
-// and the UI can treat 0 as "unknown -- default to turboquant_safe=true".
-//
-// TODO: parse GGUF KV metadata properly to extract block_count, head_count, etc.
-// Until then, we only reject known-bad head_dim=128 models via manifest.
-func tryReadHeadDim(path string) int {
-	f, err := os.Open(path)
-	if err != nil {
-		return 0
-	}
-	defer f.Close()
-	var magic [4]byte
-	if _, err := io.ReadFull(f, magic[:]); err != nil {
-		return 0
-	}
-	if string(magic[:]) != "GGUF" {
-		return 0
-	}
-	// Skip version (u32) to confirm format.
-	var ver uint32
-	if err := binary.Read(f, binary.LittleEndian, &ver); err != nil {
-		return 0
-	}
-	// Full parse out of scope; leave head_dim=0 (unknown).
-	_ = ver
-	return 0
 }
 
 // IncludeCurrent merges slot-active paths into infos, deduped. Use this when

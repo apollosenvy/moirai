@@ -5,6 +5,7 @@ import (
 	"context"
 	_ "embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -17,6 +18,20 @@ import (
 	"github.com/aegis/agent-router/internal/orchestrator"
 	"github.com/aegis/agent-router/internal/taskstore"
 )
+
+// orchestratorErrorStatus maps an orchestrator error to the HTTP status the
+// client should see. Callers pattern-match on the sentinel values rather than
+// on error text so the mapping stays stable if error strings are reworded.
+func orchestratorErrorStatus(err error) int {
+	switch {
+	case errors.Is(err, orchestrator.ErrInvalidInput):
+		return 400
+	case errors.Is(err, orchestrator.ErrTaskNotFound):
+		return 404
+	default:
+		return 500
+	}
+}
 
 //go:embed index.html
 var indexHTML []byte
@@ -284,6 +299,10 @@ func (s *Server) handleTasksByID(w http.ResponseWriter, r *http.Request) {
 	}
 	switch action {
 	case "":
+		if r.Method != http.MethodGet {
+			writeJSON(w, 405, map[string]string{"error": "GET required"})
+			return
+		}
 		res, err := s.Orch.Inspect(id)
 		if err != nil {
 			writeJSON(w, 404, map[string]string{"error": err.Error()})
@@ -296,10 +315,48 @@ func (s *Server) handleTasksByID(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err := s.Orch.Abort(id); err != nil {
-			writeJSON(w, 400, map[string]string{"error": err.Error()})
+			// Map not-found to 404; anything else is a client-ish fault
+			// (invalid id shape) so 400 remains a reasonable default.
+			status := 400
+			if errors.Is(err, orchestrator.ErrTaskNotFound) {
+				status = 404
+			}
+			writeJSON(w, status, map[string]string{"error": err.Error()})
 			return
 		}
 		writeJSON(w, 200, map[string]string{"aborted": id})
+	case "interrupt":
+		if r.Method != "POST" {
+			writeJSON(w, 405, map[string]string{"error": "POST required"})
+			return
+		}
+		if err := s.Orch.Interrupt(id); err != nil {
+			writeJSON(w, 400, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, 200, map[string]string{"interrupted": id})
+	case "inject":
+		if r.Method != "POST" {
+			writeJSON(w, 405, map[string]string{"error": "POST required"})
+			return
+		}
+		// Cap inject body at 256 KiB. A realistic nudge is a handful of
+		// lines; anything larger is either pasted context (belongs in the
+		// task description) or malformed input. MaxBytesReader surfaces
+		// its own error via the decoder when the cap is hit.
+		r.Body = http.MaxBytesReader(w, r.Body, 256<<10)
+		var body struct {
+			Message string `json:"message"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, 400, map[string]string{"error": err.Error()})
+			return
+		}
+		if err := s.Orch.Inject(id, body.Message); err != nil {
+			writeJSON(w, 400, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, 200, map[string]string{"injected": id})
 	default:
 		writeJSON(w, 404, map[string]string{"error": "unknown action"})
 	}
@@ -315,12 +372,19 @@ func (s *Server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 405, map[string]string{"error": "POST required"})
 		return
 	}
+	// Cap submit body at 256 KiB. Even the most verbose task description
+	// plus a repo_root fits comfortably; oversize bodies are either bugs
+	// or abuse.
+	r.Body = http.MaxBytesReader(w, r.Body, 256<<10)
 	var req submitReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, 400, map[string]string{"error": err.Error()})
 		return
 	}
-	if req.Description == "" {
+	// Trim before the empty-check so whitespace-only descriptions (" ",
+	// "\t\n") match the orchestrator's own guard and surface as 400 rather
+	// than being passed through and bounced back as 500.
+	if strings.TrimSpace(req.Description) == "" {
 		writeJSON(w, 400, map[string]string{"error": "description required"})
 		return
 	}
@@ -328,7 +392,7 @@ func (s *Server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	t, err := s.Orch.Submit(ctx, req.Description, req.RepoRoot)
 	if err != nil {
-		writeJSON(w, 500, map[string]string{"error": err.Error()})
+		writeJSON(w, orchestratorErrorStatus(err), map[string]string{"error": err.Error()})
 		return
 	}
 	writeJSON(w, 200, t)
@@ -337,7 +401,10 @@ func (s *Server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	data, err := json.MarshalIndent(v, "", "  ")
+	// Plain json.Marshal on the hot path. If a caller wants pretty output,
+	// pipe the response through `jq`; the extra bytes and indent work add
+	// up fast on the /tasks and /slots endpoints under live polling.
+	data, err := json.Marshal(v)
 	if err != nil {
 		fmt.Fprintf(w, `{"error": "%s"}`, err.Error())
 		return

@@ -38,6 +38,18 @@ const (
 	SlotReviewer Slot = "reviewer" // C
 )
 
+// Sampling holds per-slot default sampling parameters. Any field left at
+// the Go zero value is omitted from the llama-server request and the server
+// applies its own default (which for llama.cpp is temp=0.8, top_k=40,
+// top_p=0.95, min_p=0.05 at time of writing). Orchestrator callers may
+// override any of these per-request on ChatRequest.
+type Sampling struct {
+	Temperature float64 `json:"temperature,omitempty"`
+	TopK        int     `json:"top_k,omitempty"`
+	TopP        float64 `json:"top_p,omitempty"`
+	MinP        float64 `json:"min_p,omitempty"`
+}
+
 // ModelConfig describes a single model the manager can load.
 type ModelConfig struct {
 	Slot       Slot   `json:"slot"`
@@ -50,6 +62,10 @@ type ModelConfig struct {
 	// -ctk/-ctv. Valid values: "" (default/f16), "q8_0", "q5_1", "q4_0",
 	// "turbo3", "turbo4". Empty string means vanilla llama.cpp default.
 	KvCache string `json:"kv_cache,omitempty"`
+	// Sampling holds defaults for temperature / top_k / top_p / min_p. These
+	// are applied by Complete() when the incoming ChatRequest leaves the
+	// corresponding field zero-valued.
+	Sampling Sampling `json:"sampling,omitempty"`
 }
 
 // Config drives the manager.
@@ -72,6 +88,15 @@ type PendingChanges struct {
 type Manager struct {
 	cfg Config
 
+	// swapMu serialises the full EnsureSlot() body across concurrent
+	// callers. The older implementation released the snapshot mutex (mu)
+	// before stop()/start(), which allowed two callers targeting different
+	// slots to overlap a teardown with a startup and briefly run two
+	// llama-server processes at once (or fight over state mid-swap). swapMu
+	// covers the entire EnsureSlot critical section; mu is still used for
+	// the short reads/writes of the fields below.
+	swapMu sync.Mutex
+
 	mu         sync.Mutex
 	activeSlot Slot
 	cmd        *exec.Cmd
@@ -87,6 +112,11 @@ type Manager struct {
 	generating atomic.Bool
 
 	onSwap func(from, to Slot)
+
+	// ensureSlotEnter (test-only hook) fires inside the swapMu critical
+	// section. Production code leaves it nil. Tests use it to observe how
+	// many goroutines are concurrently inside the serialised body.
+	ensureSlotEnter func()
 }
 
 // IsGenerating reports whether a Complete() call is currently in flight.
@@ -198,6 +228,7 @@ type SlotView struct {
 	Loaded         bool            `json:"loaded"`
 	ListenPort     int             `json:"listen_port"`
 	Generating     bool            `json:"generating"`
+	Sampling       Sampling        `json:"sampling"`
 	PendingChanges *PendingChanges `json:"pending_changes,omitempty"`
 }
 
@@ -246,6 +277,7 @@ func (m *Manager) SlotsView() []SlotView {
 			Loaded:     s == active,
 			ListenPort: cfg.Port,
 			Generating: s == active && gen,
+			Sampling:   cfg.Sampling,
 		}
 		if p, has := pending[s]; has {
 			pCopy := p
@@ -280,8 +312,41 @@ func (m *Manager) ActivePort() int {
 
 // EnsureSlot guarantees the named slot is VRAM-resident. Returns the HTTP
 // base URL of the llama-server instance for that slot. Safe for concurrent
-// callers; serialises swaps.
+// callers; the entire swap body is serialised on swapMu so two goroutines
+// targeting different slots can never overlap a teardown and a startup.
+//
+// Context cancellation: swapMu queues callers strictly in arrival order, and
+// a single swap can take 30-60 seconds in production (stop + start + waitReady).
+// Under backpressure (many queued Abort'd tasks, budget timeouts, shutdown),
+// the goroutine ahead of you may be doing real work you cannot interrupt; the
+// right move for a cancelled caller is to skip the whole stop/start and let
+// the next caller through. We check ctx.Err() at every lock-reacquire point:
+// after acquiring swapMu, after the initial state snapshot, and between stop()
+// and start(). A cancelled task returns ctx.Err() without spawning anything.
+//
+// Stress-test note (BE-P5-3): an auditor observed "500 fds held" during a
+// 500-task submit+abort stress run. Each task holds a trace fd until its run
+// goroutine exits, and with swapMu serialising the backlog all 500 fds stayed
+// open while the queue drained. The early ctx.Err() checks below are the real
+// fix: cancelled tasks skip stop/start and unblock as fast as swapMu passes
+// the lock. In production with a working llama-server the queue never builds
+// past 2-3 entries, so effective fd usage stays bounded regardless.
 func (m *Manager) EnsureSlot(ctx context.Context, slot Slot) (string, error) {
+	m.swapMu.Lock()
+	defer m.swapMu.Unlock()
+
+	// Early cancellation bailout: by the time this goroutine got the lock,
+	// its caller's ctx may already be cancelled (Abort, budget timeout,
+	// shutdown). Returning now avoids a 5-second waitReady cycle for work
+	// nobody's waiting on.
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+
+	if hook := m.ensureSlotEnter; hook != nil {
+		hook()
+	}
+
 	m.mu.Lock()
 	if m.activeSlot == slot && m.cmd != nil && m.cmd.Process != nil {
 		port := m.port
@@ -289,7 +354,19 @@ func (m *Manager) EnsureSlot(ctx context.Context, slot Slot) (string, error) {
 		return fmt.Sprintf("http://127.0.0.1:%d", port), nil
 	}
 	from := m.activeSlot
+	cfg, ok := m.cfg.Models[slot]
 	m.mu.Unlock()
+
+	// Validate target slot BEFORE tearing down the active model. A bogus
+	// slot name or a missing model file used to stop the active process
+	// first and only then return an error, leaving the daemon with nothing
+	// loaded. Fail fast here so the caller's current slot stays up.
+	if !ok {
+		return "", fmt.Errorf("modelmgr: no config for slot %q", slot)
+	}
+	if _, err := os.Stat(cfg.ModelPath); err != nil {
+		return "", fmt.Errorf("modelmgr: model file missing for slot %s: %w", slot, err)
+	}
 
 	// Apply any pending changes staged while the outgoing slot was busy --
 	// must happen before stop() so the next start() sees the updated cfg.
@@ -297,21 +374,19 @@ func (m *Manager) EnsureSlot(ctx context.Context, slot Slot) (string, error) {
 		m.ApplyPending(from)
 	}
 
-	// Stop current (outside lock to avoid holding it across SIGTERM waits).
+	// Stop current.
 	if err := m.stop(); err != nil {
 		// Log but keep going; a stopped-but-not-reaped process is still stopped
 		// enough for our purposes.
 		fmt.Fprintf(os.Stderr, "modelmgr: stop during swap: %v\n", err)
 	}
 
-	m.mu.Lock()
-	cfg, ok := m.cfg.Models[slot]
-	m.mu.Unlock()
-	if !ok {
-		return "", fmt.Errorf("modelmgr: no config for slot %q", slot)
-	}
-	if _, err := os.Stat(cfg.ModelPath); err != nil {
-		return "", fmt.Errorf("modelmgr: model file missing for slot %s: %w", slot, err)
+	// stop() itself can take up to 5 seconds (SIGTERM + Wait + SIGKILL). If
+	// the caller was cancelled during that window, bail before spawning a
+	// fresh process nobody will use. The outgoing slot is already torn down;
+	// that's fine -- the next EnsureSlot caller will start whatever it needs.
+	if err := ctx.Err(); err != nil {
+		return "", err
 	}
 
 	if err := m.start(ctx, slot, cfg); err != nil {
@@ -355,9 +430,26 @@ func (m *Manager) start(ctx context.Context, slot Slot, cfg ModelConfig) error {
 		return fmt.Errorf("modelmgr: create log: %w", err)
 	}
 
+	// Kernel-anvil / smithy profile. If the profile exists (or we can
+	// generate it with the kernel-anvil CLI), hand its path to llama-server
+	// via SMITHY_CONFIG. The custom MMVQ kernels in llama-cpp-turboquant use
+	// that to dispatch shape-specific configs and win ~1.5-2x decode on
+	// 7900 XTX. Profile-gen can take up to a few minutes the first time;
+	// failures are logged and non-fatal -- llama.cpp still runs with the
+	// stock kernel dispatch.
+	env := os.Environ()
+	if smithyPath, err := ensureSmithyProfile(ctx, cfg.ModelPath); err == nil && smithyPath != "" {
+		env = append(env, "SMITHY_CONFIG="+smithyPath)
+		fmt.Fprintf(logFile, "[agent-router] SMITHY_CONFIG=%s\n", smithyPath)
+	} else if err != nil {
+		fmt.Fprintf(logFile, "[agent-router] smithy profile unavailable: %v\n", err)
+		fmt.Fprintf(os.Stderr, "modelmgr: smithy profile unavailable for slot %s: %v\n", slot, err)
+	}
+
 	cmd := exec.Command(m.cfg.LlamaServerBin, args...)
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
+	cmd.Env = env
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	if err := cmd.Start(); err != nil {
@@ -371,9 +463,34 @@ func (m *Manager) start(ctx context.Context, slot Slot, cfg ModelConfig) error {
 		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
 		time.Sleep(200 * time.Millisecond)
 		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-		logFile.Close()
+		// Reap the child so it doesn't linger as a zombie. Bounded wait
+		// mirrors the pattern used in stop(): the select/timeout guards
+		// against the kill failing to reach a stuck process.
+		done := make(chan error, 1)
+		go func() { done <- cmd.Wait() }()
+		t := time.NewTimer(2 * time.Second)
+		defer t.Stop()
+		select {
+		case <-done:
+		case <-t.C:
+		}
+		// Close the parent's logFile fd. The earlier version deliberately
+		// left this open so postmortem readers could inspect the file, but
+		// closing the parent's *os.File does NOT affect readability -- the
+		// bytes are already flushed and the file stays on disk at logPath.
+		// Leaving it open leaks one fd per failed EnsureSlot, which under
+		// a misbehaving llama-server bin (e.g. /usr/bin/true during tests
+		// or a crash loop in production) accumulates fast and eventually
+		// exhausts the daemon's fd table.
+		_ = logFile.Close()
 		return fmt.Errorf("modelmgr: slot %s not ready: %w (see %s)", slot, err, logPath)
 	}
+
+	// Child has dup'd the logFile fd via cmd.Stdout/Stderr; the parent's
+	// *os.File is no longer needed and would otherwise leak one fd per
+	// swap. Close on the success path only -- failure paths above leave
+	// the log inspectable to whoever is diagnosing the failure.
+	_ = logFile.Close()
 
 	m.mu.Lock()
 	m.activeSlot = slot
@@ -389,7 +506,6 @@ func (m *Manager) stop() error {
 	m.mu.Lock()
 	cmd := m.cmd
 	m.cmd = nil
-	prev := m.activeSlot
 	m.activeSlot = ""
 	m.port = 0
 	m.mu.Unlock()
@@ -397,16 +513,17 @@ func (m *Manager) stop() error {
 	if cmd == nil || cmd.Process == nil {
 		return nil
 	}
-	_ = prev
 	pgid := cmd.Process.Pid
 	// SIGTERM the whole process group so any llama-server children die too.
 	_ = syscall.Kill(-pgid, syscall.SIGTERM)
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
+	t := time.NewTimer(5 * time.Second)
+	defer t.Stop()
 	select {
 	case <-done:
 		return nil
-	case <-time.After(5 * time.Second):
+	case <-t.C:
 		_ = syscall.Kill(-pgid, syscall.SIGKILL)
 		<-done
 		return nil
@@ -467,6 +584,9 @@ type ChatMessage struct {
 type ChatRequest struct {
 	Messages    []ChatMessage `json:"messages"`
 	Temperature float64       `json:"temperature,omitempty"`
+	TopK        int           `json:"top_k,omitempty"`
+	TopP        float64       `json:"top_p,omitempty"`
+	MinP        float64       `json:"min_p,omitempty"`
 	MaxTokens   int           `json:"max_tokens,omitempty"`
 	Stream      bool          `json:"stream"`
 }
@@ -495,9 +615,30 @@ func (m *Manager) Complete(ctx context.Context, req ChatRequest) (string, error)
 	defer release()
 	m.mu.Lock()
 	port := m.port
+	activeSlot := m.activeSlot
+	slotCfg, hasSlotCfg := m.cfg.Models[activeSlot]
 	m.mu.Unlock()
 	if port == 0 {
 		return "", fmt.Errorf("modelmgr: no model loaded")
+	}
+	// Layer slot defaults underneath anything the caller set. A caller who
+	// passed temperature=0 explicitly still reads as zero here; that collapse
+	// is intentional -- llama.cpp treats 0 as "greedy" and we want the slot
+	// default to cover the common case where the orchestrator just forgot to
+	// specify sampling at all.
+	if hasSlotCfg {
+		if req.Temperature == 0 {
+			req.Temperature = slotCfg.Sampling.Temperature
+		}
+		if req.TopK == 0 {
+			req.TopK = slotCfg.Sampling.TopK
+		}
+		if req.TopP == 0 {
+			req.TopP = slotCfg.Sampling.TopP
+		}
+		if req.MinP == 0 {
+			req.MinP = slotCfg.Sampling.MinP
+		}
 	}
 	req.Stream = false
 	body, err := json.Marshal(req)
@@ -510,10 +651,11 @@ func (m *Manager) Complete(ctx context.Context, req ChatRequest) (string, error)
 		return "", err
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
-	// Generous timeout. Reasoning-budget unlimited + 32k+ ctx can push
-	// single-call wall time past 15 min on slow paths; we'd rather let the
-	// run complete than ragequit on token-rate headwinds.
-	client := &http.Client{Timeout: 45 * time.Minute}
+	// No hard wall-clock ceiling; the caller's ctx carries the real deadline
+	// (the orchestrator binds it to the task budget). A dedicated 45-minute
+	// client-side Timeout used to rug-pull slow reasoning runs even when the
+	// orchestrator had budget left. Cancellation still works via ctx.
+	client := &http.Client{Timeout: 0}
 	resp, err := client.Do(httpReq)
 	if err != nil {
 		return "", err

@@ -1,6 +1,7 @@
 # Build artifacts
 bin/
 build/
+/agent-router
 /phos/build/
 /phos/ui/node_modules/
 /phos/ui/dist/

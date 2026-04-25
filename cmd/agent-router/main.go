@@ -269,7 +269,7 @@ func cmdDaemon(args []string) {
 		}
 	}()
 
-	orch := orchestrator.New(orchestrator.Config{
+	orch, err := orchestrator.New(orchestrator.Config{
 		ModelMgr:         mm,
 		Store:            store,
 		L2:               l2,
@@ -278,6 +278,9 @@ func cmdDaemon(args []string) {
 		MaxPlanRevisions: cfg.MaxReplans, // config's "max_replans" maps to plan-revision budget
 		ScratchDir:       cfg.ScratchDir,
 	})
+	if err != nil {
+		fatal("orchestrator: %v", err)
+	}
 
 	srv := &api.Server{
 		Orch:                orch,

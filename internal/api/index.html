@@ -240,6 +240,26 @@ const $$ = sel => document.querySelectorAll(sel);
 
 let selectedId = null;
 let pollTimer = null;
+let pollStopped = false;
+
+// Escape user-controllable strings before interpolating into innerHTML.
+// Maps all five HTML-significant chars (< > & " '). Applies equally to
+// element text AND attribute values -- the attribute escaper is the same
+// set because attribute-value context only needs the quote that delimits
+// the attribute, but we use unquoted-safe ("attribute injection safe") by
+// escaping both quote types plus < > & always.
+function htmlEscape(s) {
+  if (s == null) return "";
+  return String(s).replace(/[<>&"']/g, c => ({
+    "<": "&lt;",
+    ">": "&gt;",
+    "&": "&amp;",
+    '"': "&quot;",
+    "'": "&#39;",
+  })[c]);
+}
+// Alias kept for intent clarity when used in attribute context.
+const htmlAttrEscape = htmlEscape;
 
 function toast(msg, isErr) {
   const el = $("#toast");
@@ -287,6 +307,7 @@ async function refreshStatus() {
     const s = await jget("/status");
     $("#live-dot").className = "dot live";
     $("#live-label").textContent = "LIVE";
+    // .textContent is XSS-safe; no escaping needed here.
     $("#s-slot").textContent = s.active_slot || "--";
     $("#s-port").textContent = s.active_port || "--";
     $("#s-running").textContent = s.running || 0;
@@ -312,14 +333,22 @@ async function refreshTasks() {
     html += '</tr></thead><tbody>';
     for (const t of tasks) {
       const sel = (t.id === selectedId) ? " selected" : "";
-      const desc = (t.description || "").replace(/[<>&]/g, c => ({"<":"&lt;",">":"&gt;","&":"&amp;"})[c]);
-      html += `<tr class="${sel}" data-id="${t.id}">`;
-      html += `<td>${fmtDate(t.updated_at)}</td>`;
-      html += `<td class="id">${shortId(t.id)}</td>`;
-      html += `<td><span class="status ${t.status}">${t.status}</span></td>`;
-      html += `<td>${t.phase || "--"}</td>`;
-      html += `<td>${t.iterations || 0}</td>`;
+      // Every interpolated value below runs through htmlEscape. Status is
+      // attacker-controllable (it's a JSON field the daemon passes through)
+      // -- without escaping, a status of 'x" onerror="...' would land in
+      // the class attribute and break out. Same risk for id/phase/desc.
+      const desc = htmlEscape(t.description || "");
+      const idEsc = htmlEscape(t.id);
+      const statusEsc = htmlEscape(t.status || "");
+      const phaseEsc = htmlEscape(t.phase || "--");
+      html += `<tr class="${sel}" data-id="${htmlAttrEscape(t.id)}">`;
+      html += `<td>${htmlEscape(fmtDate(t.updated_at))}</td>`;
+      html += `<td class="id">${htmlEscape(shortId(t.id))}</td>`;
+      html += `<td><span class="status ${statusEsc}">${statusEsc}</span></td>`;
+      html += `<td>${phaseEsc}</td>`;
+      html += `<td>${htmlEscape(String(t.iterations || 0))}</td>`;
       html += `<td class="desc" title="${desc}">${desc}</td>`;
+      void idEsc; // already consumed above; keeps eslint quiet if re-enabled
       html += "</tr>";
     }
     html += "</tbody></table>";
@@ -331,7 +360,7 @@ async function refreshTasks() {
       refreshDetail(selectedId);
     }
   } catch (e) {
-    $("#task-list").innerHTML = `<div class="empty" style="color:var(--err)">${e.message}</div>`;
+    $("#task-list").innerHTML = `<div class="empty" style="color:var(--err)">${htmlEscape(e.message)}</div>`;
   }
 }
 
@@ -351,22 +380,28 @@ async function refreshDetail(id) {
     const d = await jget("/tasks/" + encodeURIComponent(id));
     const t = d.task || {};
     const kv = $("#detail-kv");
+    // Rows where the value is a plain string land in the "safe" branch and
+    // get htmlEscape'd. The "Status" row is the only row that needs inline
+    // HTML (wrap in a .status chip), so we build that cell explicitly with
+    // an escaped status token.
+    const statusEsc = htmlEscape(t.status || "");
     const rows = [
-      ["ID", t.id],
-      ["Status", `<span class="status ${t.status}">${t.status}</span>`],
-      ["Phase", t.phase],
-      ["Iterations", t.iterations],
-      ["Replans", t.replans],
-      ["Active Model", t.active_model || "--"],
-      ["Repo Root", t.repo_root || "--"],
-      ["Branch", t.branch || "--"],
-      ["Created", fmtDate(t.created_at)],
-      ["Updated", fmtDate(t.updated_at)],
-      ["Last Error", t.last_error || ""],
-      ["Description", (t.description || "").substring(0, 400)],
+      ["ID", htmlEscape(t.id)],
+      ["Status", `<span class="status ${statusEsc}">${statusEsc}</span>`],
+      ["Phase", htmlEscape(t.phase)],
+      ["Iterations", htmlEscape(String(t.iterations == null ? "" : t.iterations))],
+      ["Replans", htmlEscape(String(t.replans == null ? "" : t.replans))],
+      ["Active Model", htmlEscape(t.active_model || "--")],
+      ["Repo Root", htmlEscape(t.repo_root || "--")],
+      ["Branch", htmlEscape(t.branch || "--")],
+      ["Created", htmlEscape(fmtDate(t.created_at))],
+      ["Updated", htmlEscape(fmtDate(t.updated_at))],
+      ["Last Error", htmlEscape(t.last_error || "")],
+      ["Description", htmlEscape((t.description || "").substring(0, 400))],
     ];
-    kv.innerHTML = rows.map(([k,v]) => `<div class="k">${k}</div><div class="v">${v == null ? "" : v}</div>`).join("");
+    kv.innerHTML = rows.map(([k,v]) => `<div class="k">${htmlEscape(k)}</div><div class="v">${v == null ? "" : v}</div>`).join("");
 
+    // .textContent is XSS-safe.
     $("#detail-plan").textContent = t.plan || "(no plan yet)";
     $("#detail-reviews").textContent = (t.reviews && t.reviews.length) ? t.reviews.join("\n\n---\n\n") : "(no reviews yet)";
 
@@ -379,14 +414,16 @@ async function refreshDetail(id) {
         const ts = e.ts ? new Date(e.ts).toLocaleTimeString() : "";
         const kind = e.kind || "?";
         const data = e.data ? JSON.stringify(e.data) : "";
-        return `<div class="evt ${kind}"><span class="ts">${ts}</span><span class="kind">${kind}</span> ${data.substring(0, 400).replace(/[<>&]/g, c => ({"<":"&lt;",">":"&gt;","&":"&amp;"})[c])}</div>`;
+        // All three (ts, kind, data) ride through htmlEscape -- kind lands
+        // in a class attribute so it must be attribute-safe too.
+        return `<div class="evt ${htmlAttrEscape(kind)}"><span class="ts">${htmlEscape(ts)}</span><span class="kind">${htmlEscape(kind)}</span> ${htmlEscape(data.substring(0, 400))}</div>`;
       }).join("");
     }
 
     const canAbort = t.status === "running" || t.status === "pending";
     $("#abort-btn").disabled = !canAbort;
   } catch (e) {
-    $("#detail-kv").innerHTML = `<div class="k">Error</div><div class="v" style="color:var(--err)">${e.message}</div>`;
+    $("#detail-kv").innerHTML = `<div class="k">Error</div><div class="v" style="color:var(--err)">${htmlEscape(e.message)}</div>`;
   }
 }
 
@@ -429,8 +466,11 @@ const QUICK_PROMPTS = [
 
 function renderQuickPrompts() {
   const root = $("#quick-prompts");
+  // QUICK_PROMPTS is a constant literal today, but escape anyway so that
+  // changing the source later (e.g. loading from a fetch) doesn't quietly
+  // reintroduce an XSS sink.
   root.innerHTML = QUICK_PROMPTS.map((p, i) =>
-    `<button style="display:block;width:100%;text-align:left;margin-bottom:6px;padding:6px 10px;font-size:11px" data-idx="${i}">&#9656; ${p[0]}</button>`
+    `<button style="display:block;width:100%;text-align:left;margin-bottom:6px;padding:6px 10px;font-size:11px" data-idx="${i}">&#9656; ${htmlEscape(p[0])}</button>`
   ).join("");
   root.querySelectorAll("button").forEach(btn => {
     btn.addEventListener("click", () => {
@@ -442,13 +482,23 @@ function renderQuickPrompts() {
 }
 
 function startPolling() {
-  if (pollTimer) clearInterval(pollTimer);
-  pollTimer = setInterval(() => {
+  // Self-scheduling setTimeout so a slow refresh never stacks with the
+  // next tick. setInterval fires regardless of whether the prior
+  // invocation finished; under a laggy daemon that means 2-3 overlapping
+  // fetches per cycle, each competing for the same UI state.
+  if (pollTimer) clearTimeout(pollTimer);
+  pollStopped = false;
+  const tick = async () => {
+    if (pollStopped) return;
     if ($("#auto-refresh").checked) {
-      refreshStatus();
-      refreshTasks();
+      try {
+        await refreshStatus();
+        await refreshTasks();
+      } catch (_) { /* individual paths show their own error state */ }
     }
-  }, 3000);
+    if (!pollStopped) pollTimer = setTimeout(tick, 3000);
+  };
+  pollTimer = setTimeout(tick, 3000);
 }
 
 // wire up

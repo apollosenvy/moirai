@@ -55,6 +55,30 @@ type Task struct {
 	Meta        map[string]string `json:"meta,omitempty"`
 }
 
+// Clone returns a deep copy of the Task. Call this before returning a Task
+// pointer across goroutine boundaries where the caller (e.g. HTTP response
+// writer) will read fields concurrently with the run goroutine's writes.
+// Strings are immutable in Go so a shallow copy suffices for those; slices
+// and maps get fresh backing arrays so later writes to the live task do not
+// race the cloned snapshot.
+func (t *Task) Clone() *Task {
+	if t == nil {
+		return nil
+	}
+	c := *t
+	if t.Reviews != nil {
+		c.Reviews = make([]string, len(t.Reviews))
+		copy(c.Reviews, t.Reviews)
+	}
+	if t.Meta != nil {
+		c.Meta = make(map[string]string, len(t.Meta))
+		for k, v := range t.Meta {
+			c.Meta[k] = v
+		}
+	}
+	return &c
+}
+
 type Store struct {
 	dir string
 	mu  sync.Mutex
