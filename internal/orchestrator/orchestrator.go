@@ -240,6 +240,26 @@ type runState struct {
 	// without racing the RO loop's read.
 	injectMu      sync.Mutex
 	pendingInject []string
+
+	// Loop-detection state. fsWriteHistory is a tiny ring of the last
+	// N (path, content-hash) pairs written by fs.write. If the model
+	// emits the SAME pair more than fsWriteRepeatCap times without an
+	// intervening non-fs.write tool call, the dispatcher rejects the
+	// duplicate and nudges the model to call test.run / ask_coder /
+	// done instead. Driven by an observed Gemma-4-26B failure mode
+	// (rematch #3 turns 21-44, where the reviewer wrote the same
+	// frontend/src/api.ts 23 times in a row without progress).
+	fsWriteHistory []fsWriteRecord
+	// consecutiveFsWrites counts fs.write calls that have happened
+	// without an intervening other tool call. Used as a soft cap to
+	// force the reviewer to verify its work.
+	consecutiveFsWrites int
+}
+
+// fsWriteRecord tracks one fs.write invocation for loop detection.
+type fsWriteRecord struct {
+	Path        string
+	ContentHash uint64
 }
 
 // New validates cfg and builds an Orchestrator. Store and ModelMgr are
@@ -535,7 +555,56 @@ const (
 	// to stop a hallucinating model from trying to dump megabytes of
 	// generated text into one file.
 	fsWriteMaxBytes = 4 << 20
+
+	// fsWriteHistoryLen is the size of the per-task ring buffer that
+	// remembers recent (path, content-hash) pairs. Eight entries comfortably
+	// covers the "rewrote the same file 3 times by accident" case without
+	// burning memory on tasks that legitimately edit one file repeatedly.
+	fsWriteHistoryLen = 8
+
+	// fsWriteRepeatCap is how many times the SAME (path, content-hash) pair
+	// may appear in fsWriteHistory before the dispatcher rejects further
+	// duplicates. 3 means: try, retry, retry, then refuse. Lower would be
+	// brittle (a quick rewrite-then-rewrite-correctly is normal); higher
+	// wastes turns the way rematch #3 did.
+	fsWriteRepeatCap = 3
+
+	// consecutiveFsWriteSoftCap is the threshold for the "you've written
+	// a lot in a row, consider verifying" advisory. Triggers once per
+	// fs.write past the cap; not a rejection, just a nudge appended to the
+	// tool result. 5 is the soft floor.
+	consecutiveFsWriteSoftCap = 5
 )
+
+// contentHash is FNV-1a 64-bit. We are not collision-resistant against
+// adversaries here; the hash is only used to detect "did the model emit
+// the EXACT same content twice" and a 64-bit hash is plenty.
+func contentHash(s string) uint64 {
+	const (
+		offset = 14695981039346656037
+		prime  = 1099511628211
+	)
+	h := uint64(offset)
+	for i := 0; i < len(s); i++ {
+		h ^= uint64(s[i])
+		h *= prime
+	}
+	return h
+}
+
+// duplicateWriteCount returns how many times the (path, hash) pair
+// appears in the recent history. The dispatcher uses this BEFORE
+// performing a write to decide whether to reject as a duplicate; the
+// caller appends the new record only on the success path.
+func duplicateWriteCount(history []fsWriteRecord, path string, hash uint64) int {
+	n := 0
+	for _, r := range history {
+		if r.Path == path && r.ContentHash == hash {
+			n++
+		}
+	}
+	return n
+}
 
 func injectQueueBytes(q []string) int {
 	n := 0
@@ -1008,6 +1077,13 @@ func (o *Orchestrator) compactLargeResult(ctx context.Context, st *runState, cal
 // executeROTool dispatches the RO's non-terminal tool calls. Terminal tools
 // (done, fail) are handled inline in roLoop.
 func (o *Orchestrator) executeROTool(ctx context.Context, st *runState, tb *toolbox.Toolbox, tc toolCall) (string, error) {
+	// Reset the consecutive-fs.write counter whenever any other tool is
+	// dispatched. The counter is only useful as "writes since last
+	// non-write action"; pensive.search / fs.read / test.run / etc. all
+	// count as breaking the streak.
+	if tc.Name != "fs.write" {
+		st.consecutiveFsWrites = 0
+	}
 	argStr := func(k string) string {
 		v, _ := tc.Args[k].(string)
 		return v
@@ -1149,6 +1225,7 @@ func (o *Orchestrator) executeROTool(ctx context.Context, st *runState, tb *tool
 			return "", fmt.Errorf("fs.write: missing required arg: content (use \"\" to write an empty file)")
 		}
 		content := argStr("content")
+		path := argStr("path")
 		// Cap individual writes at fsWriteMaxBytes. Larger writes are
 		// almost certainly a hallucinated "let me dump the entire codebase
 		// into one file" mistake; let the model recover via a useful error
@@ -1156,10 +1233,29 @@ func (o *Orchestrator) executeROTool(ctx context.Context, st *runState, tb *tool
 		if len(content) > fsWriteMaxBytes {
 			return "", fmt.Errorf("fs.write: content exceeds %d-byte cap (got %d); split the file or trim the payload", fsWriteMaxBytes, len(content))
 		}
-		res, err := tb.FSWrite(argStr("path"), content)
+		// Loop detection: reject the same (path, content-hash) pair if it
+		// appears more than fsWriteRepeatCap times in the recent history.
+		// Observed in rematch #3: Gemma-4-26B got into a 23-turn loop
+		// re-writing frontend/src/api.ts with identical content because it
+		// kept reading "OK wrote N bytes" as "the previous attempt failed,
+		// try again". Surfacing a structured error breaks the loop and
+		// nudges the model toward verification (test.run) or termination
+		// (done / ask_coder for a different decision).
+		hash := contentHash(content)
+		if duplicateWriteCount(st.fsWriteHistory, path, hash) >= fsWriteRepeatCap {
+			return "", fmt.Errorf("fs.write: rejected duplicate write to %s (you have written this exact content %d+ times in a row). Choose a different action: call test.run to verify, ask_coder for a code revision, or done if the work is complete", path, fsWriteRepeatCap)
+		}
+		res, err := tb.FSWrite(path, content)
 		if err != nil {
 			return "", err
 		}
+		// Record this write in the history ring. Keep at most
+		// fsWriteHistoryLen entries; older entries roll off the front.
+		st.fsWriteHistory = append(st.fsWriteHistory, fsWriteRecord{Path: res.Path, ContentHash: hash})
+		if len(st.fsWriteHistory) > fsWriteHistoryLen {
+			st.fsWriteHistory = st.fsWriteHistory[len(st.fsWriteHistory)-fsWriteHistoryLen:]
+		}
+		st.consecutiveFsWrites++
 		// The result string is what the RO reads as the tool return. Historical
 		// form used `created=%v` which reasoning models misread as failure when
 		// overwriting an existing file (the observed loop was Gemma-4-A4B
@@ -1171,7 +1267,15 @@ func (o *Orchestrator) executeROTool(ctx context.Context, st *runState, tb *tool
 			what = "overwritten"
 		}
 		st.workOps++
-		return fmt.Sprintf("OK wrote %d bytes to %s (%s)", res.Bytes, res.Path, what), nil
+		// After a healthy run of fs.writes, prepend a soft nudge to
+		// encourage the reviewer to verify before continuing. Stops short
+		// of rejection -- the model can ignore the nudge -- but biases
+		// toward progress.
+		suffix := ""
+		if st.consecutiveFsWrites >= consecutiveFsWriteSoftCap {
+			suffix = fmt.Sprintf(" (note: %d fs.writes in a row without verification; consider calling test.run or done next)", st.consecutiveFsWrites)
+		}
+		return fmt.Sprintf("OK wrote %d bytes to %s (%s)%s", res.Bytes, res.Path, what, suffix), nil
 
 	case "fs.search":
 		path := argStr("path_glob")
