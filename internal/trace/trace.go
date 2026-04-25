@@ -54,11 +54,16 @@ func Dir() string {
 // Open creates or appends to a trace file for the given task id.
 func Open(taskID string) (*Writer, error) {
 	dir := Dir()
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	// SEC-PASS5-005: 0700 dir, 0600 files. Trace JSONL contents include
+	// LLM responses (which carry snippets of fs.read results, tool args,
+	// and reasoning over file content) -- not material to expose to other
+	// local users on a shared host.
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
+	_ = os.Chmod(dir, 0o700)
 	path := filepath.Join(dir, fmt.Sprintf("%s.jsonl", taskID))
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
 		return nil, err
 	}
@@ -100,7 +105,32 @@ func (w *Writer) Emit(kind Kind, data map[string]any) {
 	}
 	if _, err := w.f.Write(append(line, '\n')); err != nil {
 		fmt.Fprintf(os.Stderr, "trace: write: %v\n", err)
+		return
 	}
+	// Selectively fsync on terminal events. fsync per-event would be too
+	// slow (page-cache flush on every llm_call) but losing the final error
+	// or done event because the daemon crashed within the page-cache
+	// window is the worst-case for postmortem readability. Sync KindError
+	// and KindDone so the most diagnostically valuable events always
+	// land on disk.
+	if kind == KindError || kind == KindDone {
+		_ = w.f.Sync()
+	}
+}
+
+// Fsync flushes any buffered writes to disk. Cheap to call; useful from
+// shutdown paths that want to guarantee the trace tail is durable before
+// the daemon process exits.
+func (w *Writer) Fsync() error {
+	if w == nil {
+		return nil
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed.Load() || w.f == nil {
+		return nil
+	}
+	return w.f.Sync()
 }
 
 // Close idempotently finalises the trace file. Safe to call from multiple
@@ -118,6 +148,9 @@ func (w *Writer) Close() error {
 	if w.f == nil {
 		return nil
 	}
+	// Best-effort fsync before close so a daemon crash that races Close
+	// can't lose the very last events the run goroutine emitted.
+	_ = w.f.Sync()
 	err := w.f.Close()
 	w.f = nil
 	return err
@@ -176,15 +209,19 @@ func ReadTail(taskID string, n int) ([]Event, error) {
 		return []Event{}, nil
 	}
 
-	// Read backwards in chunks until we have at least n+1 newline boundaries
-	// or we've consumed the whole file. We need n+1 because the final line
-	// may not end in a newline, and the leading partial line of a chunk
-	// isn't trustworthy without the preceding byte.
+	// Read backwards in chunks until we have at least n+2 newline boundaries
+	// or we've consumed the whole file. We need:
+	//   +1 because the leading line of any chunk that didn't reach the
+	//      file head is partial and gets dropped;
+	//   +1 because if the file ends in an incomplete (mid-write) line, the
+	//      final element after Split is a partial record we must drop too.
+	// Without that second +1, asking for tail(N) on a file whose last line
+	// was mid-write returned N-1 events.
 	const chunkSize int64 = 8192
 	var tail []byte
 	offset := size
 	newlines := 0
-	want := n + 1
+	want := n + 2
 
 	for offset > 0 && newlines < want {
 		readSize := chunkSize
@@ -208,9 +245,22 @@ func ReadTail(taskID string, n int) ([]Event, error) {
 		}
 	}
 
+	// If the file ended without a trailing newline, the last "line" is
+	// either a complete record (writer flushed mid-record-emit -- we will
+	// reject it on JSON unmarshal anyway) or a genuine partial line. Drop
+	// it iff the file ends without "\n", but only when offset==0 OR we
+	// have margin (more lines than the caller asked for) so we don't
+	// undercount on a perfectly-complete file that just happens to omit a
+	// trailing newline. The +2 in `want` above ensures we usually do.
+	hadPartialTail := size > 0 && tail[len(tail)-1] != '\n'
+
 	lines := bytes.Split(tail, []byte("\n"))
 	// Last element after Split on a trailing "\n" is empty; drop it.
 	if len(lines) > 0 && len(lines[len(lines)-1]) == 0 {
+		lines = lines[:len(lines)-1]
+	} else if hadPartialTail && len(lines) > n {
+		// Partial trailing line and we have margin: drop it so the
+		// caller sees N complete records instead of N-1 + 1 partial.
 		lines = lines[:len(lines)-1]
 	}
 	if len(lines) > n {

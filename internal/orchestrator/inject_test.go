@@ -228,6 +228,10 @@ func TestROLoopDrainsInject(t *testing.T) {
 		pendingInject: []string{
 			"please switch to exploring the config loader",
 		},
+		// Pre-seed workOps so the done() guard (STATE-FUZZ-002) doesn't
+		// reject the test's terminal call. This test exercises inject
+		// drain, not the work-before-done invariant.
+		workOps: 1,
 	}
 
 	// Skip EnsureRepo / toolbox: call roLoop directly with a nil toolbox
@@ -334,7 +338,6 @@ func TestSubmitPathExpansion(t *testing.T) {
 		want string
 	}{
 		{"tilde", "~/Projects/x", filepath.Join(home, "Projects", "x")},
-		{"home-env", "$HOME/Projects/x", filepath.Join(home, "Projects", "x")},
 		{"absolute", filepath.Join(home, "Projects", "x"), filepath.Join(home, "Projects", "x")},
 	}
 	for _, c := range cases {

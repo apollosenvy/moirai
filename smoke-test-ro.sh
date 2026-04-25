@@ -23,6 +23,36 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 BIN="${REPO_DIR}/bin/agent-router"
 PORT="${AGENT_ROUTER_PORT:-5987}"
+
+# Stub LLM ports. AR_SMOKE_PORT_BASE chooses a fixed contiguous block; if
+# unset (or set to 0), pick three free ports dynamically via the OS so two
+# concurrent smoke runs don't collide -- the pass-3 audit caught a leftover
+# stub from a previous run binding the hardcoded port and silently
+# misrouting the reviewer LLM calls.
+pick_three_free_ports() {
+    python3 - <<'PY'
+import socket
+ports = []
+socks = []
+for _ in range(3):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(("127.0.0.1", 0))
+    socks.append(s)
+    ports.append(s.getsockname()[1])
+# Close after collecting all three so the OS hands us distinct ports.
+for s in socks:
+    s.close()
+print(" ".join(str(p) for p in ports))
+PY
+}
+if [ "${AR_SMOKE_PORT_BASE:-0}" -gt 0 ]; then
+    PLANNER_PORT=$((AR_SMOKE_PORT_BASE + 0))
+    CODER_PORT=$((AR_SMOKE_PORT_BASE + 1))
+    REVIEWER_PORT=$((AR_SMOKE_PORT_BASE + 2))
+else
+    read -r PLANNER_PORT CODER_PORT REVIEWER_PORT <<<"$(pick_three_free_ports)"
+fi
+echo "[smoke-ro] stub ports: planner=$PLANNER_PORT coder=$CODER_PORT reviewer=$REVIEWER_PORT"
 TEST_REPO="$(mktemp -d /tmp/agent-router-ro-smoke.XXXXXX)"
 CONFIG="$(mktemp /tmp/agent-router-ro-smoke-config.XXXXXX.json)"
 STUB_LOG="/tmp/agent-router-ro-stub.log"
@@ -276,9 +306,9 @@ cat > "$CONFIG" <<JSON
   "max_replans": 3,
   "boot_timeout_seconds": 30,
   "models": {
-    "planner":  {"slot":"planner","model_path":"$PLANNER_FAKE","ctx_size":2048,"n_gpu_layers":0,"port":18801},
-    "coder":    {"slot":"coder","model_path":"$CODER_FAKE","ctx_size":2048,"n_gpu_layers":0,"port":18802},
-    "reviewer": {"slot":"reviewer","model_path":"$REVIEWER_FAKE","ctx_size":2048,"n_gpu_layers":0,"port":18803}
+    "planner":  {"slot":"planner","model_path":"$PLANNER_FAKE","ctx_size":2048,"n_gpu_layers":0,"port":$PLANNER_PORT},
+    "coder":    {"slot":"coder","model_path":"$CODER_FAKE","ctx_size":2048,"n_gpu_layers":0,"port":$CODER_PORT},
+    "reviewer": {"slot":"reviewer","model_path":"$REVIEWER_FAKE","ctx_size":2048,"n_gpu_layers":0,"port":$REVIEWER_PORT}
   }
 }
 JSON

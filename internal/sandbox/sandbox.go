@@ -65,8 +65,12 @@ func bwrapExec(ctx context.Context, pol Policy, argv []string) (*Result, error) 
 		"--tmpfs", "/tmp",
 		"--ro-bind", "/usr", "/usr",
 		"--ro-bind", "/etc", "/etc",
-		"--ro-bind", "/lib", "/lib",
-		"--ro-bind", "/lib64", "/lib64",
+		// /lib and /lib64 are symlinks into /usr/lib on usr-merged distros
+		// (Arch, modern Fedora/Debian, Alpine, NixOS). Use --ro-bind-try so
+		// the sandbox starts cleanly on hosts where these paths don't exist
+		// as standalone directories.
+		"--ro-bind-try", "/lib", "/lib",
+		"--ro-bind-try", "/lib64", "/lib64",
 		"--ro-bind-try", "/bin", "/bin",
 		"--ro-bind-try", "/sbin", "/sbin",
 		"--ro-bind-try", "/opt", "/opt",
@@ -77,11 +81,17 @@ func bwrapExec(ctx context.Context, pol Policy, argv []string) (*Result, error) 
 	}
 
 	if pol.RepoRoot != "" {
-		abs, _ := filepath.Abs(pol.RepoRoot)
+		abs, err := filepath.Abs(pol.RepoRoot)
+		if err != nil {
+			return nil, fmt.Errorf("sandbox: abs repo root %q: %w", pol.RepoRoot, err)
+		}
 		bwArgs = append(bwArgs, "--bind", abs, abs, "--chdir", abs)
 	}
 	if pol.ScratchDir != "" {
-		abs, _ := filepath.Abs(pol.ScratchDir)
+		abs, err := filepath.Abs(pol.ScratchDir)
+		if err != nil {
+			return nil, fmt.Errorf("sandbox: abs scratch dir %q: %w", pol.ScratchDir, err)
+		}
 		_ = os.MkdirAll(abs, 0o755)
 		bwArgs = append(bwArgs, "--bind", abs, abs)
 	}

@@ -36,11 +36,63 @@ func l2Path() string {
 
 func OpenL2() (*L2, error) {
 	p := l2Path()
-	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+	// SEC-PASS5-005: 0700 dir; SQLite file is chmod'd to 0600 after open
+	// below. The L2 stores verdict reasoning (model-authored prose about
+	// task code), which can echo file content; not world-readable.
+	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
 		return nil, err
+	}
+	_ = os.Chmod(filepath.Dir(p), 0o700)
+	// Pre-open integrity check: if the file exists and SQLite reports
+	// corruption, rename it aside and start fresh so we don't leave the
+	// daemon stuck unable to record verdicts. This is an L2 cache; losing
+	// it costs us cross-task memory recall but does not lose primary task
+	// state (that's in taskstore JSON files). Renaming preserves the
+	// corrupt copy for postmortem.
+	if _, statErr := os.Stat(p); statErr == nil {
+		probe, probeErr := sql.Open("sqlite3", p+"?_journal=WAL&_busy_timeout=5000&mode=rw")
+		if probeErr == nil {
+			row := probe.QueryRow(`PRAGMA integrity_check`)
+			var result string
+			if scanErr := row.Scan(&result); scanErr != nil || result != "ok" {
+				_ = probe.Close()
+				corruptName := fmt.Sprintf("%s.corrupt-%d", p, time.Now().Unix())
+				_ = os.Rename(p, corruptName)
+				// Best-effort rename of the WAL/SHM siblings so a
+				// fresh DB doesn't reattach to corrupt journals.
+				_ = os.Rename(p+"-wal", corruptName+"-wal")
+				_ = os.Rename(p+"-shm", corruptName+"-shm")
+				fmt.Fprintf(os.Stderr, "aegis L2: integrity_check failed (%q); renamed to %s and starting fresh\n", result, corruptName)
+			} else {
+				_ = probe.Close()
+			}
+		}
 	}
 	db, err := sql.Open("sqlite3", p+"?_journal=WAL&_busy_timeout=5000")
 	if err != nil {
+		return nil, err
+	}
+	// Tighten file mode after open. go-sqlite3 doesn't expose a creation
+	// mode on the DSN, so we Chmod the file (and any WAL/SHM siblings the
+	// driver may have created) explicitly. Best-effort: if Chmod fails the
+	// daemon still works; we just log a warning to stderr.
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		fp := p + suffix
+		if _, statErr := os.Stat(fp); statErr == nil {
+			if chmErr := os.Chmod(fp, 0o600); chmErr != nil {
+				fmt.Fprintf(os.Stderr, "aegis L2: chmod %s: %v\n", fp, chmErr)
+			}
+		}
+	}
+	// SQLite + go-sqlite3 wants a single writer connection. With the default
+	// unbounded pool, two run goroutines emitting RememberFact/RecordVerdict
+	// concurrently can each open their own write transaction and hit
+	// SQLITE_BUSY despite the busy_timeout. Cap the pool at 1 so writes
+	// serialize cleanly and the busy_timeout never has to fire.
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	if _, err := db.Exec(`PRAGMA busy_timeout=5000`); err != nil {
+		db.Close()
 		return nil, err
 	}
 	if _, err := db.Exec(`
@@ -214,15 +266,20 @@ type L3Hit struct {
 // L3Recall shells out to pensive-recall. The CLI expects a --project argument,
 // which we default to "agent-router" when the caller hasn't specified one;
 // this keeps backward compatibility with older callers that passed only a
-// query string.
-func L3Recall(ctx context.Context, query string, limit int) ([]L3Hit, error) {
-	return L3RecallProject(ctx, "agent-router", query, limit)
+// query string. The query parameter is intentionally ignored -- the current
+// pensive-recall CLI surfaces the most-recent atoms scoped to a project; it
+// does not accept a positional query. Kept on the signature for back-compat
+// with older callers; rename to L3RecentByProject is preferred for new code.
+func L3Recall(ctx context.Context, _ string, limit int) ([]L3Hit, error) {
+	return L3RecentByProject(ctx, "agent-router", limit)
 }
 
-// L3RecallProject is the explicit-project variant. The RO pensive.search tool
-// uses this; it lets the orchestrator scope memory queries to the repo under
-// work.
-func L3RecallProject(ctx context.Context, project, query string, limit int) ([]L3Hit, error) {
+// L3RecentByProject returns the most recent atoms in pensive scoped to the
+// given project. The function name reflects what the underlying CLI actually
+// does -- the previous spelling (L3RecallProject) implied a query-aware recall
+// that the CLI doesn't support, which led to a silent `_ = query` discard.
+// New callers should prefer this name.
+func L3RecentByProject(ctx context.Context, project string, limit int) ([]L3Hit, error) {
 	bin, err := exec.LookPath("pensive-recall")
 	if err != nil {
 		return nil, fmt.Errorf("pensive-recall not on PATH")
@@ -236,11 +293,9 @@ func L3RecallProject(ctx context.Context, project, query string, limit int) ([]L
 	runCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 	// pensive-recall usage: pensive-recall --project NAME [--compact] [--limit N] [--json]
-	// The query text is not a positional arg on this version of the CLI; the
-	// script recalls the most recent relevant atoms scoped to the project. We
-	// pass --json so we can parse the output reliably and surface the query
-	// back to the caller via the returned text when no direct match is found.
-	_ = query
+	// We pass --json so we can parse the output reliably across CLI shape
+	// variants. The CLI does not accept a positional query string, so callers
+	// that need text matching must filter the returned hits client-side.
 	cmd := exec.CommandContext(runCtx, bin,
 		"--project", project,
 		"--limit", fmt.Sprintf("%d", limit),
@@ -284,7 +339,11 @@ func L3RecallProject(ctx context.Context, project, query string, limit int) ([]L
 // a short block suitable for injection into a tool-call <RESULT>. Empty string
 // means no matches. Errors are surfaced to the caller.
 func PensiveSearchRaw(ctx context.Context, project, query string, k int) (string, error) {
-	hits, err := L3RecallProject(ctx, project, query, k)
+	// The underlying CLI does not accept a query string; it returns the most
+	// recent project-scoped atoms. We keep `query` on the signature for
+	// caller-facing API stability and (for now) discard it before the shell.
+	_ = query
+	hits, err := L3RecentByProject(ctx, project, k)
 	if err != nil {
 		return "", err
 	}

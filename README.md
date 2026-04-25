@@ -31,6 +31,8 @@ Produces a single ~14 MB static binary. No external runtime deps beyond
      "default_repo": "/home/aegis/Projects/some-repo",
      "max_coder_retries": 3,
      "max_replans": 1,
+     "max_plan_revisions": 3,
+     "max_ro_turns": 40,
      "models": {
        "planner":  {"slot": "planner",  "model_path": "/home/aegis/Models/Qwen3.5-27B-Claude-Distill/Qwen3.5-27B-Claude-4.6-Opus-Reasoning-Distilled-Q4_K_M.gguf", "ctx_size": 8192, "n_gpu_layers": 99, "port": 8001},
        "coder":    {"slot": "coder",    "model_path": "/home/aegis/Models/gpt-oss-20b-bf16.gguf",                                                                      "ctx_size": 8192, "n_gpu_layers": 99, "port": 8002},
@@ -39,6 +41,12 @@ Produces a single ~14 MB static binary. No external runtime deps beyond
    }
    JSON
    ```
+
+   The numeric override fields (`port`, `max_coder_retries`, `max_replans`,
+   `max_plan_revisions`, `max_ro_turns`, `boot_timeout_seconds`) are decoded
+   as JSON pointers so that an explicit `0` is honored as "use this exact
+   value" rather than silently falling back to the built-in default. Omit
+   the key entirely to use the default.
 
 2. Start the daemon:
 
@@ -86,8 +94,11 @@ to reading the task store on disk if the daemon is down.
 | `/status` | GET | Daemon + active slot + task counts |
 | `/tasks` | GET | List all tasks |
 | `/tasks/<id>` | GET | Full task record + last 20 events |
-| `/tasks/<id>/abort` | POST | Stop a task |
-| `/submit` | POST | `{"description": "...", "repo_root": "..."}` |
+| `/tasks/<id>/abort` | POST | Stop a task. 409 if task is already in a terminal state. |
+| `/tasks/<id>/inject` | POST | `{"message": "..."}` - queue a user-authored guidance message for the running RO loop. 404 if unknown, 409 if terminal, 400 on empty message. Body capped at 256 KiB. |
+| `/tasks/<id>/interrupt` | POST | Soft interrupt: queues a fixed "stop your current line of reasoning" nudge. 404 if unknown, 409 if terminal. |
+| `/submit` | POST | `{"description": "...", "repo_root": "..."}`. Body capped at 256 KiB; unknown JSON fields rejected with 400. |
+| `/slots/<id>` | PATCH | Reconfigure a model slot (`model_path`, `ctx_size`, `kv_cache`). Body capped at 64 KiB; unknown fields rejected. |
 
 ## Workflow (what the daemon does to a task)
 
@@ -196,10 +207,21 @@ Event kinds: `phase`, `swap`, `llm_call`, `tool_call`, `verdict`, `error`,
 
 ## Smoke test
 
-`./smoke-test.sh` builds the binary, spins up a throwaway git repo, and
-runs the daemon against small placeholder GGUFs (tinyllama, qwen3-8b,
-phi3-mini) to verify the A-C-B-C loop end to end. Expect ~60 seconds wall
-clock on a warm kernel cache. Output lands in `/tmp/agent-router-smoke.log`.
+Two smoke tests live in the repo root:
+
+- `./smoke-test.sh` builds the binary, spins up a throwaway git repo, and
+  runs the daemon against small placeholder GGUFs (tinyllama, qwen3-8b,
+  phi3-mini) to verify the A-C-B-C loop end to end. Expect ~60 seconds wall
+  clock on a warm kernel cache. Requires real model files. Output lands in
+  `/tmp/agent-router-smoke.log`.
+- `./smoke-test-ro.sh` is the Reviewer-Orchestrator (RO) loop smoke test.
+  It needs no real LLMs; three tiny Python HTTP stubs mimic
+  llama-server's chat-completions endpoint with canned responses, then
+  the full daemon runs against them. Verifies submit + RO loop reaches
+  ask_planner / ask_coder / fs.write / test.run / done and that the trace
+  records `ro_tool_call`, `p_reply`, `c_reply` events. Stub ports are
+  picked dynamically by default; set `AR_SMOKE_PORT_BASE=18801` to pin a
+  fixed three-port block.
 
 ## State layout
 

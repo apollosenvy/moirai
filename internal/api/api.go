@@ -9,14 +9,16 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"os/exec"
+	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/aegis/agent-router/internal/modelmgr"
 	"github.com/aegis/agent-router/internal/models"
 	"github.com/aegis/agent-router/internal/orchestrator"
-	"github.com/aegis/agent-router/internal/taskstore"
 )
 
 // orchestratorErrorStatus maps an orchestrator error to the HTTP status the
@@ -28,6 +30,8 @@ func orchestratorErrorStatus(err error) int {
 		return 400
 	case errors.Is(err, orchestrator.ErrTaskNotFound):
 		return 404
+	case errors.Is(err, orchestrator.ErrTerminalTask):
+		return 409
 	default:
 		return 500
 	}
@@ -148,8 +152,15 @@ func (s *Server) handleSlotsByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Cap PATCH body at 64 KiB. The patchSlotBody surface is four small
+	// fields; anything larger is either a hostile/buggy client or an
+	// accidental large paste. /submit and /inject already cap their own
+	// bodies; this closes the asymmetry flagged in the pass-3 audit.
+	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
 	var body patchSlotBody
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&body); err != nil {
 		writeJSON(w, 400, map[string]string{"error": err.Error()})
 		return
 	}
@@ -183,23 +194,53 @@ func (s *Server) handleSlotsByID(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"applied": false, "pending": true, "reason": "queued-for-next-swap"})
 }
 
+// modelsCache memoises the most recent ListGGUF + IncludeCurrent merge so
+// /models hits don't re-scan ModelsDir on every UI poll. PERF-2.
+var (
+	modelsMu        sync.Mutex
+	modelsCacheAt   time.Time
+	modelsCacheData []models.Info
+	modelsCacheKey  string
+)
+
+const modelsCacheTTL = 30 * time.Second
+
 func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeJSON(w, 405, map[string]string{"error": "GET required"})
 		return
 	}
-	infos, err := models.ListGGUF(s.ModelsDir)
-	if err != nil {
-		writeJSON(w, 500, map[string]string{"error": err.Error()})
-		return
-	}
-	// Include current slot model paths even if outside ModelsDir.
+	// Build the cache key from ModelsDir + the current slot paths so we
+	// invalidate whenever a slot swap changes which paths get merged in.
 	slots := s.ModelMgr.SlotsView()
 	paths := make([]string, 0, len(slots))
 	for _, sl := range slots {
 		paths = append(paths, sl.ModelPath)
 	}
+	key := s.ModelsDir + "|" + strings.Join(paths, "|")
+
+	modelsMu.Lock()
+	if modelsCacheKey == key && time.Since(modelsCacheAt) < modelsCacheTTL && modelsCacheData != nil {
+		out := modelsCacheData
+		modelsMu.Unlock()
+		writeJSON(w, 200, out)
+		return
+	}
+	modelsMu.Unlock()
+
+	infos, err := models.ListGGUF(s.ModelsDir)
+	if err != nil {
+		writeJSON(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
 	infos = models.IncludeCurrent(infos, paths)
+
+	modelsMu.Lock()
+	modelsCacheKey = key
+	modelsCacheAt = time.Now()
+	modelsCacheData = infos
+	modelsMu.Unlock()
+
 	writeJSON(w, 200, infos)
 }
 
@@ -231,22 +272,13 @@ func (s *Server) handleUI(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	tasks, _ := s.Orch.Status()
 	running := 0
-	var activeTask *taskstore.Task
 	for _, t := range tasks {
 		if string(t.Status) == "running" {
 			running++
-			if activeTask == nil {
-				activeTask = t
-			}
 		}
 	}
-	var phase taskstore.Phase
-	if activeTask != nil {
-		phase = activeTask.Phase
-	}
 	verdict := s.Orch.LastVerdict()
-	nextSlots := orchestrator.NextSlots(phase, verdict, activeTask != nil)
-	reviewStage := orchestrator.ReviewStage(phase)
+	vramUsed, vramTotal := readVRAM()
 
 	writeJSON(w, 200, map[string]any{
 		"service":              "agent-router",
@@ -257,11 +289,13 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"active_port":          s.ModelMgr.ActivePort(),
 		"task_count":           len(tasks),
 		"running":              running,
-		"next_slots":           nextSlots,
-		"review_stage":         nullIfEmpty(reviewStage),
 		"last_verdict":         nullIfEmpty(verdict),
 		"turboquant_supported": s.TurboquantSupported,
 		"daemon_version":       s.DaemonVersion,
+		"max_ro_turns":         s.Orch.MaxROTurns(),
+		"vram_used_mb":         vramUsed,
+		"vram_total_mb":        vramTotal,
+		"corrupt_task_count":   s.Orch.CorruptTaskCount(),
 	})
 }
 
@@ -272,7 +306,71 @@ func nullIfEmpty(s string) any {
 	return s
 }
 
+// vramCache memoises the most recent rocm-smi parse so /status (which
+// is polled aggressively by the UI) doesn't fork+exec the tool on every
+// hit. Cache TTL is 5s -- long enough to absorb the 3s UI poll cadence,
+// short enough that operator-visible VRAM swings on slot swaps don't
+// look frozen.
+var (
+	vramMu        sync.Mutex
+	vramAt        time.Time
+	vramUsedCache int
+	vramTotCache  int
+)
+
+const vramCacheTTL = 5 * time.Second
+
+// readVRAM returns (used_mb, total_mb) from rocm-smi. Returns (0, 0) on
+// any failure (binary missing, parse error, GPU not present) so /status
+// degrades cleanly on machines without the tool.
+func readVRAM() (int, int) {
+	vramMu.Lock()
+	defer vramMu.Unlock()
+	if time.Since(vramAt) < vramCacheTTL {
+		return vramUsedCache, vramTotCache
+	}
+	used, total := queryROCmSMI()
+	vramUsedCache = used
+	vramTotCache = total
+	vramAt = time.Now()
+	return used, total
+}
+
+func queryROCmSMI() (int, int) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "rocm-smi", "--showmeminfo", "vram", "--csv").Output()
+	if err != nil {
+		return 0, 0
+	}
+	// Output is CSV with a header; the data row contains:
+	//   device,VRAM Total Memory (B),VRAM Total Used Memory (B)
+	// Find the first non-header row that has at least 3 fields and parse.
+	lines := strings.Split(string(out), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(strings.ToLower(line), "device") {
+			continue
+		}
+		fields := strings.Split(line, ",")
+		if len(fields) < 3 {
+			continue
+		}
+		totalB, err1 := strconv.ParseUint(strings.TrimSpace(fields[1]), 10, 64)
+		usedB, err2 := strconv.ParseUint(strings.TrimSpace(fields[2]), 10, 64)
+		if err1 != nil || err2 != nil {
+			continue
+		}
+		return int(usedB / (1024 * 1024)), int(totalB / (1024 * 1024))
+	}
+	return 0, 0
+}
+
 func (s *Server) handleTasks(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, 405, map[string]string{"error": "GET required"})
+		return
+	}
 	tasks, err := s.Orch.Status()
 	if err != nil {
 		writeJSON(w, 500, map[string]string{"error": err.Error()})
@@ -305,7 +403,13 @@ func (s *Server) handleTasksByID(w http.ResponseWriter, r *http.Request) {
 		}
 		res, err := s.Orch.Inspect(id)
 		if err != nil {
-			writeJSON(w, 404, map[string]string{"error": err.Error()})
+			// Inspect now returns ErrTaskNotFound for missing tasks; map it
+			// to a clean 404 body without leaking the on-disk path.
+			if errors.Is(err, orchestrator.ErrTaskNotFound) {
+				writeJSON(w, 404, map[string]string{"error": fmt.Sprintf("task not found: %s", id)})
+				return
+			}
+			writeJSON(w, 500, map[string]string{"error": err.Error()})
 			return
 		}
 		writeJSON(w, 200, res)
@@ -315,11 +419,15 @@ func (s *Server) handleTasksByID(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err := s.Orch.Abort(id); err != nil {
-			// Map not-found to 404; anything else is a client-ish fault
-			// (invalid id shape) so 400 remains a reasonable default.
+			// Map not-found to 404; terminal-state collisions to 409;
+			// anything else is a client-ish fault (invalid id shape) so 400
+			// remains a reasonable default.
 			status := 400
-			if errors.Is(err, orchestrator.ErrTaskNotFound) {
+			switch {
+			case errors.Is(err, orchestrator.ErrTaskNotFound):
 				status = 404
+			case errors.Is(err, orchestrator.ErrTerminalTask):
+				status = 409
 			}
 			writeJSON(w, status, map[string]string{"error": err.Error()})
 			return
@@ -331,7 +439,14 @@ func (s *Server) handleTasksByID(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err := s.Orch.Interrupt(id); err != nil {
-			writeJSON(w, 400, map[string]string{"error": err.Error()})
+			status := 400
+			switch {
+			case errors.Is(err, orchestrator.ErrTaskNotFound):
+				status = 404
+			case errors.Is(err, orchestrator.ErrTerminalTask):
+				status = 409
+			}
+			writeJSON(w, status, map[string]string{"error": err.Error()})
 			return
 		}
 		writeJSON(w, 200, map[string]string{"interrupted": id})
@@ -348,12 +463,21 @@ func (s *Server) handleTasksByID(w http.ResponseWriter, r *http.Request) {
 		var body struct {
 			Message string `json:"message"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		dec := json.NewDecoder(r.Body)
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&body); err != nil {
 			writeJSON(w, 400, map[string]string{"error": err.Error()})
 			return
 		}
 		if err := s.Orch.Inject(id, body.Message); err != nil {
-			writeJSON(w, 400, map[string]string{"error": err.Error()})
+			status := 400
+			switch {
+			case errors.Is(err, orchestrator.ErrTaskNotFound):
+				status = 404
+			case errors.Is(err, orchestrator.ErrTerminalTask):
+				status = 409
+			}
+			writeJSON(w, status, map[string]string{"error": err.Error()})
 			return
 		}
 		writeJSON(w, 200, map[string]string{"injected": id})
@@ -377,7 +501,9 @@ func (s *Server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 	// or abuse.
 	r.Body = http.MaxBytesReader(w, r.Body, 256<<10)
 	var req submitReq
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
 		writeJSON(w, 400, map[string]string{"error": err.Error()})
 		return
 	}
@@ -401,14 +527,19 @@ func (s *Server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	// Plain json.Marshal on the hot path. If a caller wants pretty output,
-	// pipe the response through `jq`; the extra bytes and indent work add
-	// up fast on the /tasks and /slots endpoints under live polling.
-	data, err := json.Marshal(v)
-	if err != nil {
-		fmt.Fprintf(w, `{"error": "%s"}`, err.Error())
+	// PERF-9: stream encode rather than allocate the full payload first.
+	// On /tasks at 10k tasks the marshalled JSON is ~5MB; json.Marshal +
+	// Write allocates that buffer per request, which is the largest
+	// allocator-pressure source under live UI polling. Encoder.Encode also
+	// writes a trailing newline for free, so we drop the explicit "\n".
+	enc := json.NewEncoder(w)
+	if err := enc.Encode(v); err != nil {
+		// Headers are already flushed; best we can do is append an error
+		// line. The status code is whatever the caller set (often 200 by
+		// the time we get here), so the client will see a malformed body
+		// rather than an HTTP error -- that's fine because Encode failures
+		// are nearly always upstream client-disconnects, not encoder bugs.
+		fmt.Fprintf(w, `{"error": "%s"}`+"\n", err.Error())
 		return
 	}
-	w.Write(data)
-	w.Write([]byte("\n"))
 }

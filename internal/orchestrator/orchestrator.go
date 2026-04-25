@@ -65,7 +65,24 @@ var (
 	// when the caller references a task id the orchestrator does not know
 	// about. It maps to HTTP 404.
 	ErrTaskNotFound = errors.New("task not found")
+	// ErrTerminalTask is returned by Abort and Inject (and friends) when the
+	// caller targets a task that has already reached a terminal status
+	// (succeeded / failed / aborted). The HTTP layer maps this to 409 so the
+	// operator gets a clear "no-op, task already <status>" instead of a
+	// silent 200. Status text is wrapped in the error message for context.
+	ErrTerminalTask = errors.New("task is in terminal state")
 )
+
+// IsTerminal reports whether a task status is one the orchestrator considers
+// final -- i.e. no further state transitions are possible. Centralised here
+// so api/orchestrator agree on the set.
+func IsTerminal(s taskstore.Status) bool {
+	switch s {
+	case taskstore.StatusSucceeded, taskstore.StatusFailed, taskstore.StatusAborted:
+		return true
+	}
+	return false
+}
 
 // --- shared budgets --------------------------------------------------------
 
@@ -124,6 +141,14 @@ type Orchestrator struct {
 	vmu           sync.Mutex
 	lastVerdict   string
 	lastVerdictAt time.Time
+
+	// Daemon-lifetime context: every run goroutine derives its ctx from
+	// daemonCtx (via context.WithCancel), so a single cancel() at Shutdown
+	// time cuts the entire fleet of in-flight tasks. runWG tracks the
+	// goroutines so Shutdown can wait for them to drain.
+	daemonCtx    context.Context
+	daemonCancel context.CancelFunc
+	runWG        sync.WaitGroup
 }
 
 // LastVerdict returns the most recent verdict emitted by the Reviewer,
@@ -132,6 +157,27 @@ func (o *Orchestrator) LastVerdict() string {
 	o.vmu.Lock()
 	defer o.vmu.Unlock()
 	return o.lastVerdict
+}
+
+// MaxROTurns returns the configured RO turn cap. Surfaced for /status so
+// the UI can display "turn N / cap" without duplicating the default-fill
+// logic from New().
+func (o *Orchestrator) MaxROTurns() int {
+	if o == nil {
+		return 0
+	}
+	return o.cfg.MaxROTurns
+}
+
+// CorruptTaskCount returns the number of task JSON files List() found
+// to be unreadable or invalid (malformed JSON, missing id, etc.).
+// Surfaced for /status so operators have visibility into silent task
+// drops.
+func (o *Orchestrator) CorruptTaskCount() int {
+	if o == nil || o.cfg.Store == nil {
+		return 0
+	}
+	return o.cfg.Store.CorruptCount()
 }
 
 func (o *Orchestrator) setLastVerdict(v string) {
@@ -146,6 +192,13 @@ type runState struct {
 	task   *taskstore.Task
 	trace  *trace.Writer
 
+	// wgInc is true when Submit incremented orchestrator.runWG before
+	// launching this goroutine. The defer in run() consults it to decide
+	// whether to call Done(); test harnesses that invoke run() directly
+	// (without going through Submit) leave it false so we don't underflow
+	// the wait group.
+	wgInc bool
+
 	// abortRequested is flipped to true by Abort() before it cancels the
 	// run ctx. The run goroutine's defer checks this flag to decide
 	// between StatusAborted (operator-driven) and StatusFailed (ctx
@@ -158,6 +211,20 @@ type runState struct {
 	askCoderCalls    int
 	askPlannerCalls  int
 	roTurns          int
+
+	// workOps counts "real work" tool invocations so the done() guard can
+	// reject premature termination. Increments on ask_coder, fs.write,
+	// test.run, compile.run. Read-only tools (fs.read, fs.search,
+	// pensive.search) and ask_planner do NOT count as work -- a planner
+	// call alone cannot constitute completing the task.
+	workOps int
+
+	// terminating is set true while the goroutine is exiting (after the
+	// roLoop returns). Inject must observe this flag under o.mu so it can
+	// reject mid-teardown injections cleanly with ErrTerminalTask rather
+	// than enqueueing into a struct that is about to be dropped from
+	// o.running.
+	terminating atomic.Bool
 
 	// Last emitted plan (for context when RO calls ask_coder without
 	// passing one, and for L2 persistence).
@@ -203,10 +270,45 @@ func New(cfg Config) (*Orchestrator, error) {
 	if cfg.CompactThresholdBytes == 0 {
 		cfg.CompactThresholdBytes = DefaultCompactThresholdBytes
 	}
+	dctx, dcancel := context.WithCancel(context.Background())
 	return &Orchestrator{
-		cfg:     cfg,
-		running: make(map[string]*runState),
+		cfg:          cfg,
+		running:      make(map[string]*runState),
+		daemonCtx:    dctx,
+		daemonCancel: dcancel,
 	}, nil
+}
+
+// Shutdown cancels every in-flight run goroutine's context and waits for
+// them to drain, up to the supplied timeout. Daemon main() should call this
+// before httpSrv.Shutdown so trace files, taskstore writes, and llama-server
+// teardown all happen on a clean path rather than racing os.Exit.
+//
+// Returns nil if all goroutines drain within the timeout, otherwise an error
+// with the count still outstanding.
+func (o *Orchestrator) Shutdown(timeout time.Duration) error {
+	if o == nil || o.daemonCancel == nil {
+		return nil
+	}
+	o.daemonCancel()
+	done := make(chan struct{})
+	go func() {
+		o.runWG.Wait()
+		close(done)
+	}()
+	if timeout <= 0 {
+		<-done
+		return nil
+	}
+	select {
+	case <-done:
+		return nil
+	case <-time.After(timeout):
+		o.mu.Lock()
+		n := len(o.running)
+		o.mu.Unlock()
+		return fmt.Errorf("orchestrator: %d task(s) still draining after %s", n, timeout)
+	}
 }
 
 // Submit enqueues a new task. The returned task id is durable across daemon
@@ -238,8 +340,18 @@ func (o *Orchestrator) Submit(ctx context.Context, description, repoRoot string)
 	if err != nil {
 		return nil, fmt.Errorf("%w: repo root: %v", ErrInvalidInput, err)
 	}
-	if _, err := os.Stat(abs); err != nil {
-		return nil, fmt.Errorf("%w: repo root: %v", ErrInvalidInput, err)
+	// Use a generic message on stat failure: the resolved path may
+	// reflect env-var substitutions or absolute paths the operator
+	// considers sensitive, and echoing it back into a 400 response leaks
+	// information to any HTTP caller. The trace records the original
+	// repo_root for postmortem correlation; the wire response stays
+	// generic.
+	info, err := os.Stat(abs)
+	if err != nil {
+		return nil, fmt.Errorf("%w: repo_root is not accessible", ErrInvalidInput)
+	}
+	if !info.IsDir() {
+		return nil, fmt.Errorf("%w: repo_root is not a directory", ErrInvalidInput)
 	}
 
 	id := newTaskID()
@@ -262,7 +374,15 @@ func (o *Orchestrator) Submit(ctx context.Context, description, repoRoot string)
 	t.TracePath = tr.Path()
 	_ = o.cfg.Store.Save(t)
 
-	runCtx, cancel := context.WithCancel(context.Background())
+	// Derive the run ctx from the orchestrator's daemon-lifetime ctx so
+	// Shutdown(timeout) cancels every in-flight task. Falls back to
+	// context.Background() if New() ran without a daemonCtx (older test
+	// harnesses).
+	parentCtx := context.Background()
+	if o.daemonCtx != nil {
+		parentCtx = o.daemonCtx
+	}
+	runCtx, cancel := context.WithCancel(parentCtx)
 	st := &runState{cancel: cancel, task: t, trace: tr}
 
 	o.mu.Lock()
@@ -275,6 +395,8 @@ func (o *Orchestrator) Submit(ctx context.Context, description, repoRoot string)
 	// same instant the run goroutine wrote it.
 	snapshot := t.Clone()
 
+	o.runWG.Add(1)
+	st.wgInc = true
 	go o.run(runCtx, st)
 	return snapshot, nil
 }
@@ -305,6 +427,9 @@ func (o *Orchestrator) Abort(id string) error {
 			t.Status = taskstore.StatusAborted
 			return o.cfg.Store.Save(t)
 		}
+		if IsTerminal(t.Status) {
+			return fmt.Errorf("%w: task already %s", ErrTerminalTask, t.Status)
+		}
 		return nil
 	}
 	st.abortRequested.Store(true)
@@ -331,19 +456,93 @@ func (o *Orchestrator) Inject(taskID, message string) error {
 	}
 	o.mu.Lock()
 	st, ok := o.running[taskID]
+	if ok && st.terminating.Load() {
+		// Race: roLoop has exited but the goroutine has not yet removed st
+		// from o.running. Treat the task as terminal so the HTTP layer
+		// returns 409 instead of silently queueing into a state that is
+		// about to be discarded.
+		o.mu.Unlock()
+		return fmt.Errorf("%w: task is finalizing", ErrTerminalTask)
+	}
+	if ok && st.task != nil && IsTerminal(st.task.Status) {
+		// Same window: the run goroutine has marked the task succeeded /
+		// failed / aborted but has not yet completed cleanup. Reject so the
+		// caller does not silently drop guidance.
+		o.mu.Unlock()
+		return fmt.Errorf("%w: task already %s", ErrTerminalTask, st.task.Status)
+	}
 	o.mu.Unlock()
 	if !ok {
+		// Distinguish "task does not exist at all" from "task exists but
+		// isn't running" so the HTTP layer can map the former to 404 and
+		// the latter to 409 (when the task hit a terminal state).
+		t, err := o.cfg.Store.Load(taskID)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return fmt.Errorf("%w: %s", ErrTaskNotFound, taskID)
+			}
+			return err
+		}
+		if IsTerminal(t.Status) {
+			return fmt.Errorf("%w: task already %s", ErrTerminalTask, t.Status)
+		}
 		return fmt.Errorf("inject: task %s not running", taskID)
 	}
 	st.injectMu.Lock()
 	st.pendingInject = append(st.pendingInject, message)
+	// Cap the queue at maxInjectQueueLen messages OR maxInjectQueueBytes
+	// total bytes, whichever fires first. On overflow, drop OLDEST
+	// entries so the most recent operator guidance is preserved. Without
+	// this cap an attacker (or a buggy auto-resending UI) can grow the
+	// slice unbounded while a slow LLM task is in flight, since the RO
+	// loop only drains pendingInject at the top of each turn.
+	dropped := 0
+	for len(st.pendingInject) > maxInjectQueueLen {
+		st.pendingInject = st.pendingInject[1:]
+		dropped++
+	}
+	for injectQueueBytes(st.pendingInject) > maxInjectQueueBytes && len(st.pendingInject) > 1 {
+		st.pendingInject = st.pendingInject[1:]
+		dropped++
+	}
 	depth := len(st.pendingInject)
 	st.injectMu.Unlock()
 	st.trace.Emit(trace.KindInfo, map[string]any{
 		"inject":    shorten(message, 200),
 		"queue_len": depth,
 	})
+	if dropped > 0 {
+		st.trace.Emit(trace.KindInfo, map[string]any{
+			"inject_dropped_oldest": dropped,
+			"queue_len_after":       depth,
+			"reason":                "pending_inject queue cap exceeded",
+		})
+	}
 	return nil
+}
+
+// pendingInject queue caps. Tuned conservatively: a real human steering
+// session emits a handful of messages over minutes; anything beyond 64
+// queued messages or 256KB of pending guidance is almost certainly a
+// runaway client.
+const (
+	maxInjectQueueLen   = 64
+	maxInjectQueueBytes = 256 << 10
+
+	// fsWriteMaxBytes caps a single fs.write payload. 4 MB is large enough
+	// to cover any realistic source file (the largest file in this repo at
+	// the time of writing is the orchestrator at ~50 KB) and small enough
+	// to stop a hallucinating model from trying to dump megabytes of
+	// generated text into one file.
+	fsWriteMaxBytes = 4 << 20
+)
+
+func injectQueueBytes(q []string) int {
+	n := 0
+	for _, s := range q {
+		n += len(s)
+	}
+	return n
 }
 
 // Interrupt is a soft interrupt: it queues a user message that tells the
@@ -366,6 +565,12 @@ type InspectResult struct {
 func (o *Orchestrator) Inspect(id string) (*InspectResult, error) {
 	t, err := o.cfg.Store.Load(id)
 	if err != nil {
+		// Translate the on-disk "no such file" into ErrTaskNotFound so the
+		// HTTP layer can return a clean "task not found: <id>" body rather
+		// than leaking the daemon's internal task-store path.
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("%w: %s", ErrTaskNotFound, id)
+		}
 		return nil, err
 	}
 	// ReadTail seeks from EOF; avoids re-reading the entire trace jsonl on
@@ -382,6 +587,41 @@ func (o *Orchestrator) Status() ([]*taskstore.Task, error) {
 
 func (o *Orchestrator) run(ctx context.Context, st *runState) {
 	defer func() {
+		if st != nil && st.wgInc {
+			o.runWG.Done()
+		}
+	}()
+	// Panic recovery: a panic in extractToolCall, regex parsing, a model
+	// call, the toolbox, or anywhere else in the long-running RO loop used
+	// to crash the entire daemon (HTTP handler panics are caught by net/http
+	// but goroutines we spawn ourselves are not). Convert it into a normal
+	// task failure with the stack noted on the trace, so the rest of the
+	// daemon survives.
+	defer func() {
+		if r := recover(); r != nil {
+			msg := fmt.Sprintf("panic in run goroutine: %v", r)
+			fmt.Fprintln(os.Stderr, "orchestrator: "+msg)
+			if st.task != nil {
+				st.task.Status = taskstore.StatusFailed
+				st.task.LastError = msg
+				if o.cfg.Store != nil {
+					_ = o.cfg.Store.Save(st.task)
+				}
+			}
+			if st.trace != nil {
+				st.trace.Emit(trace.KindError, map[string]any{
+					"fatal":  msg,
+					"source": "panic_recover",
+				})
+			}
+		}
+	}()
+	defer func() {
+		// Mark as terminating BEFORE removing from o.running so any concurrent
+		// Inject sees ErrTerminalTask instead of a transient
+		// "running but no task" race window. The flag is observed under
+		// o.mu so a Lock() in Inject is enough to serialize.
+		st.terminating.Store(true)
 		o.mu.Lock()
 		delete(o.running, st.task.ID)
 		o.mu.Unlock()
@@ -465,8 +705,13 @@ func (o *Orchestrator) run(ctx context.Context, st *runState) {
 		"turns":   st.roTurns,
 	})
 
+	o.setLastVerdict("succeeded")
+	tr.Emit(trace.KindVerdict, map[string]any{
+		"phase":   "final",
+		"verdict": "succeeded",
+		"summary": shorten(summary, 4000),
+	})
 	if o.cfg.L2 != nil {
-		o.setLastVerdict("succeeded")
 		_ = o.cfg.L2.RecordVerdict(t.RepoRoot, t.ID, "final", "succeeded", shorten(summary, 4000))
 	}
 }
@@ -545,7 +790,7 @@ func (o *Orchestrator) roLoop(ctx context.Context, st *runState, tb *toolbox.Too
 			"head":  shorten(resp, 400),
 		})
 
-		call, ok := extractToolCall(resp)
+		call, ok, parseErr := extractToolCallChecked(resp)
 
 		// RO-prose-bloat guard: if RO emitted no tool call AND the response is
 		// large (>8 KB), truncate it before appending to messages. Unbounded
@@ -561,6 +806,19 @@ func (o *Orchestrator) roLoop(ctx context.Context, st *runState, tb *toolbox.Too
 				head, len(resp)-5120, tail)
 		}
 		messages = append(messages, modelmgr.ChatMessage{Role: "assistant", Content: assistantContent})
+
+		if errors.Is(parseErr, ErrMultipleToolCalls) {
+			// Surface a recoverable error to the model rather than silently
+			// picking one block and dropping the rest. The model can resend
+			// with a single tool call.
+			errMsg := "more than one <TOOL>...</TOOL> block in the same response; emit exactly one per turn"
+			messages = append(messages, modelmgr.ChatMessage{
+				Role:    "user",
+				Content: fmt.Sprintf("<ERROR>%s</ERROR>", errMsg),
+			})
+			tr.Emit(trace.KindInfo, map[string]any{"ro_nudge": "multi_tool_call", "turn": st.roTurns})
+			continue
+		}
 
 		if !ok {
 			// Nudge once, then give up.
@@ -583,6 +841,25 @@ func (o *Orchestrator) roLoop(ctx context.Context, st *runState, tb *toolbox.Too
 		// Terminal tools.
 		switch call.Name {
 		case "done":
+			// Reject premature done: a model that emits done before doing
+			// any real work has hallucinated success. Require at least one
+			// of {ask_coder, fs.write, test.run, compile.run} to have been
+			// invoked successfully on this run. Recoverable: we send an
+			// error back to the model and let it pick a real next step.
+			if st.workOps == 0 {
+				errMsg := "cannot call done before performing any work; call ask_planner/ask_coder or fs.write/test.run first"
+				tr.Emit(trace.KindToolCall, map[string]any{
+					"kind":  "ro_tool_call",
+					"name":  "done",
+					"error": errMsg,
+					"turn":  st.roTurns,
+				})
+				messages = append(messages, modelmgr.ChatMessage{
+					Role:    "user",
+					Content: fmt.Sprintf("<ERROR>%s</ERROR>", errMsg),
+				})
+				continue
+			}
 			summary, _ := call.Args["summary"].(string)
 			tr.Emit(trace.KindToolCall, map[string]any{
 				"kind":    "ro_tool_call",
@@ -593,6 +870,11 @@ func (o *Orchestrator) roLoop(ctx context.Context, st *runState, tb *toolbox.Too
 			return summary, true, nil
 		case "fail":
 			reason, _ := call.Args["reason"].(string)
+			// Sanitize empty / whitespace-only reasons so LastError doesn't
+			// end up as "fail: " (a trailing colon with nothing after it).
+			if strings.TrimSpace(reason) == "" {
+				reason = "task failed (no reason provided)"
+			}
 			tr.Emit(trace.KindToolCall, map[string]any{
 				"kind":   "ro_tool_call",
 				"name":   "fail",
@@ -638,12 +920,47 @@ func (o *Orchestrator) roLoop(ctx context.Context, st *runState, tb *toolbox.Too
 
 		payload := ""
 		if toolErr != nil {
-			payload = fmt.Sprintf("<ERROR>%s</ERROR>", toolErr.Error())
+			payload = fmt.Sprintf("<ERROR>%s</ERROR>", neutralizeEnvelopeTags(toolErr.Error()))
 		} else {
-			payload = fmt.Sprintf("<RESULT>%s</RESULT>", result)
+			// SEC-PASS5-004: neutralize <TOOL>...</TOOL> and </RESULT>
+			// substrings inside the tool output before wrapping. A planted
+			// file containing `</RESULT><TOOL>{...}</TOOL>` would otherwise
+			// inject a synthetic tool envelope into the next user-role
+			// message; a sufficiently confused model parroting the file
+			// content into its next assistant reply could then trip
+			// extractToolCallChecked into executing the planted call.
+			payload = fmt.Sprintf("<RESULT>%s</RESULT>", neutralizeEnvelopeTags(result))
 		}
 		messages = append(messages, modelmgr.ChatMessage{Role: "user", Content: payload})
 	}
+}
+
+// neutralizeEnvelopeTags replaces tag-like substrings inside model-controlled
+// tool output that could otherwise impersonate the orchestrator's own
+// <RESULT>...</RESULT> / <TOOL>...</TOOL> envelopes. A file deliberately
+// planted to contain `</RESULT><TOOL>{...}</TOOL>` would, when handed back
+// verbatim, look to a downstream reader (and to a parroting model) like the
+// orchestrator itself emitted a synthetic tool call. We rewrite the literal
+// tag forms to non-collidable variants. Legitimate prose mentions of the
+// tag names survive via the "_LITERAL" suffix, which is unambiguous to a
+// human reader and harmless to the regex parser. SEC-PASS5-004.
+func neutralizeEnvelopeTags(s string) string {
+	if s == "" {
+		return s
+	}
+	if !strings.ContainsAny(s, "<") {
+		return s
+	}
+	// Order matters only for clarity; the replacements don't overlap.
+	r := strings.NewReplacer(
+		"<TOOL>", "<TOOL_LITERAL>",
+		"</TOOL>", "</TOOL_LITERAL>",
+		"<RESULT>", "<RESULT_LITERAL>",
+		"</RESULT>", "</RESULT_LITERAL>",
+		"<ERROR>", "<ERROR_LITERAL>",
+		"</ERROR>", "</ERROR_LITERAL>",
+	)
+	return r.Replace(s)
 }
 
 // compactLargeResult emits the full tool result as a Pensive atom and returns
@@ -683,21 +1000,55 @@ func (o *Orchestrator) executeROTool(ctx context.Context, st *runState, tb *tool
 		v, _ := tc.Args[k].(string)
 		return v
 	}
-	argInt := func(k string, def int) int {
-		switch v := tc.Args[k].(type) {
-		case float64:
-			return int(v)
-		case int:
-			return v
-		case string:
-			var n int
-			_, _ = fmt.Sscanf(v, "%d", &n)
-			if n == 0 {
-				return def
-			}
-			return n
+	// argHas reports whether the model included the named key at all in
+	// args, even with a zero/empty value. Distinguishes "fs.write content:
+	// \"\"" (deliberate truncation, allowed) from "fs.write" with no
+	// content field at all (malformed call, must reject).
+	argHas := func(k string) bool {
+		_, ok := tc.Args[k]
+		return ok
+	}
+	// argInt parses an integer from the args map. Uses json.Number-aware
+	// handling: float64 inputs are bounds-checked against int64 to refuse
+	// silent truncation of values like 1e20 down to a small int. Reject
+	// rather than silently clamp -- a model emitting 1e20 is confused, and
+	// silently turning that into 0 or some random int is worse than
+	// surfacing the error.
+	argInt := func(k string, def int) (int, error) {
+		raw, ok := tc.Args[k]
+		if !ok {
+			return def, nil
 		}
-		return def
+		switch v := raw.(type) {
+		case float64:
+			if v != v || v > 9.2233720368547758e18 || v < -9.2233720368547758e18 {
+				return 0, fmt.Errorf("arg %q: numeric out of int64 range", k)
+			}
+			// Reject non-integers to avoid silent truncation surprises.
+			if v != float64(int64(v)) {
+				return 0, fmt.Errorf("arg %q: expected integer, got %v", k, v)
+			}
+			return int(v), nil
+		case int:
+			return v, nil
+		case json.Number:
+			n, err := v.Int64()
+			if err != nil {
+				return 0, fmt.Errorf("arg %q: %w", k, err)
+			}
+			return int(n), nil
+		case string:
+			if v == "" {
+				return def, nil
+			}
+			var n int
+			_, err := fmt.Sscanf(v, "%d", &n)
+			if err != nil {
+				return 0, fmt.Errorf("arg %q: %w", k, err)
+			}
+			return n, nil
+		}
+		return def, nil
 	}
 
 	switch tc.Name {
@@ -716,7 +1067,16 @@ func (o *Orchestrator) executeROTool(ctx context.Context, st *runState, tb *tool
 		}
 		st.lastPlan = plan
 		st.task.Plan = plan
-		_ = o.cfg.Store.Save(st.task)
+		if err := o.cfg.Store.Save(st.task); err != nil {
+			st.trace.Emit(trace.KindInfo, map[string]any{
+				"save_error": err.Error(),
+				"context":    "ask_planner persist plan",
+			})
+		}
+		// ask_planner does NOT count toward workOps: the done() guard wants
+		// to see real progress (code, writes, tests), and a planner call alone
+		// could otherwise satisfy the guard for a model that emits plan->done
+		// with no implementation.
 		return plan, nil
 
 	case "ask_coder":
@@ -742,17 +1102,49 @@ func (o *Orchestrator) executeROTool(ctx context.Context, st *runState, tb *tool
 		if retryMode {
 			st.lastTestFailed = false
 		}
+		st.workOps++
 		return code, nil
 
 	case "fs.read":
-		res, err := tb.FSRead(argStr("path"), 1<<17)
+		path := argStr("path")
+		// Reject directory reads early so the model doesn't waste a turn on
+		// an "is a directory" syscall error. fs.search is the right tool for
+		// directory-level inspection. Resolve relative paths against the
+		// repo root so the stat covers the same target the toolbox will
+		// open.
+		if path != "" {
+			candidate := path
+			if !filepath.IsAbs(candidate) {
+				candidate = filepath.Join(tb.RepoRoot, candidate)
+			}
+			if info, err := os.Stat(candidate); err == nil && info.IsDir() {
+				return "", fmt.Errorf("fs.read: path is a directory; use fs.search instead")
+			}
+		}
+		res, err := tb.FSRead(path, 1<<17)
 		if err != nil {
 			return "", err
 		}
 		return res.Content, nil
 
 	case "fs.write":
-		res, err := tb.FSWrite(argStr("path"), argStr("content"))
+		// Reject malformed calls that omit the content key entirely. An
+		// LLM that emits {"path": "foo.go"} (with no content field) used
+		// to truncate the target file silently because argStr defaults to
+		// "" and that is a legitimate "wipe this file" request. Distinguish
+		// "explicitly empty content" (allowed) from "missing key" (rejected).
+		if !argHas("content") {
+			return "", fmt.Errorf("fs.write: missing required arg: content (use \"\" to write an empty file)")
+		}
+		content := argStr("content")
+		// Cap individual writes at fsWriteMaxBytes. Larger writes are
+		// almost certainly a hallucinated "let me dump the entire codebase
+		// into one file" mistake; let the model recover via a useful error
+		// rather than corrupting the repo.
+		if len(content) > fsWriteMaxBytes {
+			return "", fmt.Errorf("fs.write: content exceeds %d-byte cap (got %d); split the file or trim the payload", fsWriteMaxBytes, len(content))
+		}
+		res, err := tb.FSWrite(argStr("path"), content)
 		if err != nil {
 			return "", err
 		}
@@ -766,6 +1158,7 @@ func (o *Orchestrator) executeROTool(ctx context.Context, st *runState, tb *tool
 		if !res.Created {
 			what = "overwritten"
 		}
+		st.workOps++
 		return fmt.Sprintf("OK wrote %d bytes to %s (%s)", res.Bytes, res.Path, what), nil
 
 	case "fs.search":
@@ -776,7 +1169,14 @@ func (o *Orchestrator) executeROTool(ctx context.Context, st *runState, tb *tool
 		if path == "" {
 			path = "."
 		}
-		hits, err := tb.FSSearch(ctx, argStr("pattern"), path, 50)
+		pattern := argStr("pattern")
+		// Empty patterns are rejected up-front so we don't surface an
+		// opaque ripgrep "regex parse error" downstream. Whitespace-only
+		// patterns are also rejected as obvious mistakes.
+		if strings.TrimSpace(pattern) == "" {
+			return "", fmt.Errorf("fs.search: pattern required (non-empty)")
+		}
+		hits, err := tb.FSSearch(ctx, pattern, path, 50)
 		if err != nil {
 			return "", err
 		}
@@ -797,6 +1197,7 @@ func (o *Orchestrator) executeROTool(ctx context.Context, st *runState, tb *tool
 		} else {
 			st.lastTestFailed = false
 		}
+		st.workOps++
 		return out, nil
 
 	case "compile.run":
@@ -804,17 +1205,22 @@ func (o *Orchestrator) executeROTool(ctx context.Context, st *runState, tb *tool
 		if err != nil {
 			return "", err
 		}
+		st.workOps++
 		return fmt.Sprintf("exit=%d\nstdout:\n%s\nstderr:\n%s",
 			r.ExitCode, shorten(r.Stdout, 4000), shorten(r.Stderr, 2000)), nil
 
 	case "pensive.search":
 		q := argStr("query")
-		k := argInt("k", 5)
+		k, err := argInt("k", 5)
+		if err != nil {
+			return "", fmt.Errorf("pensive.search: %w", err)
+		}
 		project := argStr("project")
 		if project == "" {
 			project = filepath.Base(st.task.RepoRoot)
 		}
-		out, err := aegis.PensiveSearchRaw(ctx, project, q, k)
+		out, perr := aegis.PensiveSearchRaw(ctx, project, q, k)
+		err = perr
 		if err != nil {
 			// Non-fatal: return a string the RO can see, not an error.
 			return fmt.Sprintf("(pensive.search unavailable: %v)", err), nil
@@ -1063,12 +1469,27 @@ func (o *Orchestrator) fail(st *runState, t *taskstore.Task, tr *trace.Writer, e
 		t.LastError = err.Error()
 		_ = o.cfg.Store.Save(t)
 		tr.Emit(trace.KindInfo, map[string]any{"aborted_by_user": true, "reason": err.Error()})
+		o.setLastVerdict("aborted")
+		tr.Emit(trace.KindVerdict, map[string]any{
+			"phase":   "final",
+			"verdict": "aborted",
+			"reason":  err.Error(),
+		})
 		return
 	}
 	t.Status = taskstore.StatusFailed
 	t.LastError = err.Error()
 	_ = o.cfg.Store.Save(t)
 	tr.Emit(trace.KindError, map[string]any{"fatal": err.Error()})
+	o.setLastVerdict("failed")
+	tr.Emit(trace.KindVerdict, map[string]any{
+		"phase":   "final",
+		"verdict": "failed",
+		"reason":  err.Error(),
+	})
+	if o.cfg.L2 != nil {
+		_ = o.cfg.L2.RecordVerdict(t.RepoRoot, t.ID, "final", "failed", shorten(err.Error(), 4000))
+	}
 }
 
 // --- system prompts --------------------------------------------------------
@@ -1135,7 +1556,11 @@ Your tools (emit exactly one per turn, wrapped in <TOOL>...</TOOL>):
   fs.search        args: {"pattern": "...", "path_glob": "."}
   test.run         args: {}
   compile.run      args: {}
-  pensive.search   args: {"query": "...", "k": 5}
+  pensive.search   args: {"project": "...", "k": 5}
+                   (returns the most-recent reasoning atoms for the named
+                   project. The query parameter is currently ignored by the
+                   pensive backend; results are recency-ordered, not query-
+                   matched. Use a higher k if you need broader recall.)
   pensive.emit_atom args: {"kind": "discovery"|"failure"|"insight",
                            "principle": "transferable rule you learned",
                            "context": "situational shape (what the lesson is about)",
@@ -1222,7 +1647,43 @@ var (
 	toolTagOpen  = regexp.MustCompile(`(?s)<TOOL>.*?<TOOL>`)
 )
 
+// maxToolScanBytes caps how much of the model's response we feed to the
+// regex engine. The lazy `.*?` patterns are bounded but the overall scan
+// is still O(n) in the worst case, and the bare-JSON last-resort walk at
+// the end of this function reads the whole string. 256KB is comfortably
+// larger than any normal LLM reply we accept; anything larger is either
+// a stream that already overflowed an earlier truncation guard or hostile
+// input. We trim from the front (terminal tags live near the end).
+const maxToolScanBytes = 256 * 1024
+
+// ErrMultipleToolCalls is returned by extractToolCall when the model emitted
+// more than one <TOOL>...</TOOL> block in the same response. The RO contract
+// is one tool call per turn; surfacing this explicitly lets the caller send a
+// recoverable error back to the model rather than silently picking the first
+// match and dropping the rest.
+var ErrMultipleToolCalls = errors.New("more than one tool call per response")
+
+// extractToolCall returns the first valid tool call in the response, or false
+// with no match. Returns (zero, false) and a sentinel error via the dedicated
+// multi-call helper when more than one tagged tool block appears.
 func extractToolCall(s string) (toolCall, bool) {
+	tc, ok, _ := extractToolCallChecked(s)
+	return tc, ok
+}
+
+// extractToolCallChecked is the multi-call-aware variant. The third return
+// value is non-nil when the input contained more than one TOOL block; the
+// caller can surface that as a recoverable model error. When err is nil the
+// (toolCall, ok) pair has the same semantics as extractToolCall.
+func extractToolCallChecked(s string) (toolCall, bool, error) {
+	if len(s) > maxToolScanBytes {
+		s = s[len(s)-maxToolScanBytes:]
+	}
+	// Multi-block detection: count strict-form <TOOL>...</TOOL> blocks. If
+	// more than one is present, refuse to silently pick the first one.
+	if matches := toolTagClose.FindAllStringIndex(s, -1); len(matches) > 1 {
+		return toolCall{}, false, ErrMultipleToolCalls
+	}
 	// Shorthand form: <TOOL>name args: {...}</TOOL>. Check these FIRST so a
 	// well-formed shorthand wins over the last-resort bare-JSON scan below.
 	for _, re := range []*regexp.Regexp{toolREShorthand, toolREShorthandOpen} {
@@ -1245,7 +1706,7 @@ func extractToolCall(s string) (toolCall, bool) {
 		if args == nil {
 			args = map[string]any{}
 		}
-		return toolCall{Name: name, Args: args}, true
+		return toolCall{Name: name, Args: args}, true, nil
 	}
 
 	for _, re := range []*regexp.Regexp{toolREClosed, toolREOpen, toolREStart} {
@@ -1271,33 +1732,104 @@ func extractToolCall(s string) (toolCall, bool) {
 		if tc.Args == nil {
 			tc.Args = map[string]any{}
 		}
-		return tc, true
+		return tc, true, nil
 	}
-	// Last resort: scan for a top-level JSON object that has a "name" key.
-	if idx := strings.Index(s, `"name"`); idx >= 0 {
-		start := strings.LastIndexByte(s[:idx], '{')
-		if start >= 0 {
-			depth := 0
-			for i := start; i < len(s); i++ {
-				if s[i] == '{' {
-					depth++
-				} else if s[i] == '}' {
-					depth--
-					if depth == 0 {
-						var tc toolCall
-						if err := json.Unmarshal([]byte(s[start:i+1]), &tc); err == nil && tc.Name != "" {
-							if tc.Args == nil {
-								tc.Args = map[string]any{}
-							}
-							return tc, true
-						}
-						break
+	// Tag-bounded balanced-JSON fallback: any `<TOOL>...</TOOL>` (or `<TOOL>...`
+	// open variant) with a balanced JSON object inside, regardless of whether
+	// the name is encoded as a JSON `"name"` field or as a leading bareword and
+	// the args use `:`, `=`, or quoted-JSON syntax. This catches Gemma /
+	// Mistral / GPT-OSS variants the strict regexes miss, e.g.:
+	//   <TOOL>ask_planner args='{"instruction":"..."}'</TOOL>
+	//   <TOOL>ask_planner args={"instruction":"..."}</TOOL>
+	//   <TOOL>ask_planner {"instruction":"..."}</TOOL>
+	//   <TOOL>{"name":"ask_planner","args":{...}}</TOOL>  (when lazy regex misfires on nested `}`)
+	// Safe vs prose-injection: still requires the literal `<TOOL>` tag, which
+	// pass-5 neutralizeEnvelopeTags rewrites out of any tool output before the
+	// model ever sees it (so a planted file cannot smuggle `<TOOL>` back in).
+	if start := strings.Index(s, "<TOOL>"); start >= 0 {
+		inner := s[start+len("<TOOL>"):]
+		if end := strings.Index(inner, "</TOOL>"); end >= 0 {
+			inner = inner[:end]
+		} else if reopen := strings.Index(inner, "<TOOL>"); reopen >= 0 {
+			inner = inner[:reopen]
+		}
+		// Try whole-object form first: inner contains {"name":"X","args":{...}}.
+		if obj, ok := balancedObject(inner); ok {
+			var tc toolCall
+			if err := json.Unmarshal([]byte(obj), &tc); err == nil && tc.Name != "" {
+				if tc.Args == nil {
+					tc.Args = map[string]any{}
+				}
+				return tc, true, nil
+			}
+			// Fall through: maybe the JSON IS the args and the name is a
+			// leading bareword. Parse the prefix.
+			if name := extractLeadingName(inner); name != "" && isKnownToolName(name) {
+				var args map[string]any
+				if err := json.Unmarshal([]byte(obj), &args); err == nil {
+					if args == nil {
+						args = map[string]any{}
 					}
+					return toolCall{Name: name, Args: args}, true, nil
 				}
 			}
 		}
 	}
-	return toolCall{}, false
+	// Last resort: only fire if the response begins with `{` after stripping
+	// leading whitespace AND no <TOOL> block was found. The previous version
+	// scanned the entire response for any "name":... + balanced JSON, which
+	// happily executed prose like:
+	//   I am thinking about calling { "name": "fail", ... } but I won't
+	// Scoping to a leading bare-JSON object eliminates that prose-execution
+	// attack surface while still accepting models that emit a strict JSON
+	// reply with no tag wrapper.
+	trimmed := strings.TrimLeft(s, " \t\r\n")
+	if strings.HasPrefix(trimmed, "{") {
+		if obj, ok := balancedObject(trimmed); ok {
+			var tc toolCall
+			if err := json.Unmarshal([]byte(obj), &tc); err == nil && tc.Name != "" {
+				if tc.Args == nil {
+					tc.Args = map[string]any{}
+				}
+				return tc, true, nil
+			}
+		}
+	}
+	return toolCall{}, false, nil
+}
+
+// extractLeadingName returns the first bareword (letters, digits, `.`, `_`)
+// at the start of s, with leading whitespace skipped. Empty string if the
+// first non-whitespace character is not name-shaped.
+func extractLeadingName(s string) string {
+	s = strings.TrimLeft(s, " \t\r\n")
+	end := 0
+	for end < len(s) {
+		c := s[end]
+		isLetter := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+		isDigit := c >= '0' && c <= '9'
+		if isLetter || isDigit || c == '.' || c == '_' {
+			end++
+			continue
+		}
+		break
+	}
+	return s[:end]
+}
+
+// isKnownToolName guards the bareword-prefix branch of the parser so a
+// random word followed by a balanced JSON object cannot be coerced into a
+// tool dispatch. Keep this list in sync with executeROTool's switch.
+func isKnownToolName(name string) bool {
+	switch name {
+	case "ask_planner", "ask_coder",
+		"fs.read", "fs.write", "fs.search",
+		"test.run", "compile.run",
+		"pensive.search", "pensive.emit_atom",
+		"done", "fail":
+		return true
+	}
+	return false
 }
 
 // balancedObject walks the string looking for the first balanced {...} and

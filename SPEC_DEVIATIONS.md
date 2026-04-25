@@ -106,6 +106,7 @@ path when a Gemma-4-31B build lands.
 | `test.run`      | no  | no  | no  | yes |
 | `compile.run`   | no  | no  | no  | yes |
 | `pensive.search`| no  | no  | no  | yes |
+| `pensive.emit_atom` | no | no | no | yes |
 | `done` / `fail` | no  | no  | no  | yes |
 
 The planner is nominally allowed `fs.write` but the orchestrator only honors
@@ -169,7 +170,7 @@ is given the tool defaults to the basename of the task's repo root.
 
 If `pensive-recall` is missing or fails, the tool returns a non-fatal
 string rather than an error so the RO can reason about the miss. See
-`internal/aegis/aegis.go` functions `L3RecallProject` and
+`internal/aegis/aegis.go` functions `L3RecentByProject` and
 `PensiveSearchRaw`.
 
 ### Preserved subsystems
@@ -200,3 +201,38 @@ Verifies the trace records `ro_tool_call`, `p_reply`, `c_reply` events,
 
 This does NOT exercise real LLM inference; the legacy `smoke-test.sh`
 still covers that (when llama-server can load models).
+
+## Em dash in commit messages (2026-04-24)
+
+Pass 1 added a U+2014 / U+2013 filter to GitCommit() so rogue model
+output couldn't slip an em-dash into a commit message. Pass 2 found
+that this filter creates a self-DoS loop: a user description that
+contains U+2014 round-trips through the RO model, the model echoes the
+description into a commit summary, and the commit then fails for a
+reason the operator did not introduce.
+
+Resolution: the filter is removed. The em-dash hate is a policy on
+human-authored AEGIS prose, not on machine-authored commit messages.
+GitCommit no longer rejects U+2014 / U+2013 runes.
+
+## /status surface (2026-04-24, RO-rewrite cleanup)
+
+The legacy `next_slots` and `review_stage` fields have been removed
+from /status. They were derived from a fine-grained phase taxonomy
+(`PhasePlanReview`, `PhaseCodeReview`, etc.) that the RO loop no
+longer drives -- those values were always stale, so the predicted-
+slot UI chrome was misleading.
+
+The current /status surface is:
+
+| Field | Source |
+|-------|--------|
+| `service`, `port`, `started_at`, `uptime` | trivial |
+| `active_slot`, `active_port` | modelmgr |
+| `task_count`, `running` | taskstore.List |
+| `last_verdict` | orchestrator (RecordVerdict) |
+| `turboquant_supported` | DetectTurboquant on startup |
+| `daemon_version` | build-time |
+| `max_ro_turns` | orchestrator.Config |
+| `vram_used_mb`, `vram_total_mb` | rocm-smi (5s cache, 0/0 on failure) |
+| `corrupt_task_count` | taskstore.List skip counter |

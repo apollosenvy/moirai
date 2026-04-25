@@ -6,7 +6,6 @@
 package repoconfig
 
 import (
-	"bufio"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -56,24 +55,29 @@ func defaults() Config {
 
 // Load looks for .agent-router.toml at repoRoot. If missing, returns defaults
 // with ok=false.
+//
+// Reads the whole file at once rather than streaming with bufio.Scanner --
+// the previous Scanner-based path inherited the default 64KB line cap and
+// returned bufio.ErrTooLong on a long forbidden.paths entry or notes string,
+// which then bubbled up to the orchestrator and failed the entire task.
+// 30-line config files do not need streaming; one ReadFile is fine.
 func Load(repoRoot string) (Config, bool, error) {
 	path := filepath.Join(repoRoot, ".agent-router.toml")
-	f, err := os.Open(path)
+	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return defaults(), false, nil
 		}
 		return Config{}, false, err
 	}
-	defer f.Close()
 
 	cfg := defaults()
 	cfg.Path = path
 
 	var section string
-	scan := bufio.NewScanner(f)
-	for scan.Scan() {
-		line := strings.TrimSpace(scan.Text())
+	for i, raw := range strings.Split(string(data), "\n") {
+		lineNo := i + 1
+		line := strings.TrimSpace(raw)
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
@@ -89,11 +93,8 @@ func Load(repoRoot string) (Config, bool, error) {
 		val := strings.TrimSpace(line[eq+1:])
 		val = strings.TrimSpace(stripComment(val))
 		if err := apply(&cfg, section, key, val); err != nil {
-			return cfg, true, fmt.Errorf("%s: %w", path, err)
+			return cfg, true, fmt.Errorf("%s:%d: %w", path, lineNo, err)
 		}
-	}
-	if err := scan.Err(); err != nil {
-		return cfg, true, err
 	}
 	return cfg, true, nil
 }
@@ -127,7 +128,13 @@ func apply(cfg *Config, section, key, val string) error {
 		case "language":
 			cfg.Style.Language = unquote(val)
 		case "line_length":
-			n, _ := strconv.Atoi(val)
+			n, err := strconv.Atoi(val)
+			if err != nil {
+				return fmt.Errorf("style.line_length: invalid int %q: %w", val, err)
+			}
+			if n < 0 {
+				return fmt.Errorf("style.line_length must be >= 0, got %d", n)
+			}
 			cfg.Style.LineLength = n
 		case "notes":
 			cfg.Style.Notes = unquote(val)
@@ -143,11 +150,17 @@ func apply(cfg *Config, section, key, val string) error {
 			if err != nil {
 				return err
 			}
+			if d <= 0 {
+				return fmt.Errorf("budget.max_runtime must be > 0, got %s", d)
+			}
 			cfg.Budget.MaxRuntime = d
 		case "max_iterations":
 			n, err := strconv.Atoi(val)
 			if err != nil {
 				return err
+			}
+			if n <= 0 {
+				return fmt.Errorf("budget.max_iterations must be > 0, got %d", n)
 			}
 			cfg.Budget.MaxIterations = n
 		}
@@ -193,10 +206,28 @@ func parseDuration(s string) (time.Duration, error) {
 	return time.ParseDuration(s)
 }
 
-// ForbiddenHit returns true if candidate matches any forbidden path.
+// ForbiddenHit returns true if relPath matches any forbidden path.
+//
+// Matching is path-component aware: "sec" forbids the directory "sec/" and
+// the literal file "sec", but does NOT match "secrets/" or "security_audit.md".
+// The previous string-prefix implementation accidentally collapsed those
+// distinctions and over-blocked legitimate paths. Trailing-separator
+// normalization plus exact-equality covers both directory and file forbids.
 func (c *Config) ForbiddenHit(relPath string) bool {
-	for _, p := range c.Forbidden.Paths {
-		if strings.HasPrefix(relPath, p) {
+	// Normalise to forward slashes so config rules are portable across OSes.
+	rel := filepath.ToSlash(filepath.Clean(relPath))
+	for _, raw := range c.Forbidden.Paths {
+		p := filepath.ToSlash(filepath.Clean(raw))
+		if p == "" || p == "." {
+			continue
+		}
+		if rel == p {
+			return true
+		}
+		// Component boundary: relPath must continue with a separator after
+		// the forbidden prefix. Plain HasPrefix("secrets", "sec") would
+		// match incorrectly; HasPrefix("secrets/", "sec/") does not.
+		if strings.HasPrefix(rel, p+"/") {
 			return true
 		}
 	}

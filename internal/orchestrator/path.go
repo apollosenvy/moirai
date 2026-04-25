@@ -8,39 +8,40 @@ import (
 )
 
 // expandUserPath resolves shell-like conveniences in a user-supplied path
-// before it reaches filepath.Abs. Go's stdlib doesn't do tilde expansion or
-// env var expansion; without this, submit forms that contain "~/Projects/x"
-// or "$HOME/Projects/x" end up stat'ing bogus concatenated paths relative
-// to the daemon's cwd.
+// before it reaches filepath.Abs. Go's stdlib doesn't do tilde expansion;
+// without this, submit forms that contain "~/Projects/x" end up stat'ing
+// bogus concatenated paths relative to the daemon's cwd.
 //
-// Supported substitutions (all are shell conventions users expect):
+// Supported substitutions:
 //
 //   ~           -> $HOME
 //   ~/sub       -> $HOME/sub
-//   $HOME/sub   -> value of HOME env var (and any other plain $VAR)
-//   ${VAR}/sub  -> value of VAR with the braced form
 //
-// Only ~ at path start is expanded (matching shell behavior); tilde in the
-// middle of a path segment is treated as a literal. We explicitly do NOT
-// handle ~user/... -- that needs /etc/passwd lookups, and in practice the
-// daemon runs as a single user so $HOME is always the right answer.
+// Only a leading ~ is expanded. Any other $VAR / ${VAR} token in the
+// supplied path is intentionally NOT expanded -- doing so via
+// os.ExpandEnv would let an unauthenticated HTTP caller exfiltrate
+// arbitrary daemon environment values (HF_TOKEN, AWS_SECRET_ACCESS_KEY,
+// PATH, etc.) by submitting repo_root="$HF_TOKEN" and reading the
+// expanded value back from the os.Stat error message returned in the
+// 400 response. Leaving $VAR literal means the subsequent stat/open
+// fails naturally without leaking env values.
+//
+// We explicitly do NOT handle ~user/... -- that needs /etc/passwd
+// lookups, and in practice the daemon runs as a single user so $HOME
+// is always the right answer.
 //
 // The returned path is run through filepath.Clean so traversal segments
 // like "~/../.." collapse to their canonical form. NOTE: this is a
-// normalisation, not a sandbox. The final path is NOT restricted to live
-// inside $HOME; absolute paths from the caller are still accepted and
-// returned verbatim. Callers that need containment must enforce it
+// normalisation, not a sandbox. The final path is NOT restricted to
+// live inside $HOME; absolute paths from the caller are still accepted
+// and returned verbatim. Callers that need containment must enforce it
 // themselves (e.g. by checking filepath.HasPrefix against an allowed
 // root after this function returns).
 func expandUserPath(p string) (string, error) {
 	if p == "" {
 		return p, nil
 	}
-	// Env expansion first so ${HOME} and $HOME both resolve before we look
-	// for the literal "~" prefix. os.ExpandEnv is a pure string op and
-	// leaves unrecognized $VAR tokens as empty.
-	out := os.ExpandEnv(p)
-
+	out := p
 	if out == "~" || strings.HasPrefix(out, "~/") {
 		home, err := os.UserHomeDir()
 		if err != nil {

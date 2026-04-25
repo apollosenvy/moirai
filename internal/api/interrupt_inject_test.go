@@ -71,12 +71,13 @@ func TestAPIInterruptEndpoint(t *testing.T) {
 		t.Errorf("expected interrupted=%q, got %v", id, body)
 	}
 
-	// POST on unknown task -> 400.
+	// POST on unknown task -> 404 (ErrTaskNotFound is wrapped by the
+	// orchestrator and mapped at the HTTP boundary).
 	req = httptest.NewRequest("POST", "/tasks/nope-not-a-real-id/interrupt", nil)
 	w = httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, req)
-	if w.Code != 400 {
-		t.Errorf("unknown-task expected 400, got %d", w.Code)
+	if w.Code != 404 {
+		t.Errorf("unknown-task expected 404, got %d", w.Code)
 	}
 
 	// GET on interrupt -> 405.
@@ -121,14 +122,15 @@ func TestAPIInjectEndpoint(t *testing.T) {
 		t.Errorf("malformed JSON expected 400, got %d", w.Code)
 	}
 
-	// POST on non-running task -> 400.
+	// POST on unknown task -> 404 (the persisted record doesn't exist;
+	// orchestrator wraps ErrTaskNotFound which the HTTP layer maps).
 	req = httptest.NewRequest("POST", "/tasks/never-ran/inject",
 		bytes.NewReader([]byte(`{"message":"hi"}`)))
 	req.Header.Set("Content-Type", "application/json")
 	w = httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, req)
-	if w.Code != 400 {
-		t.Errorf("inject on unknown task expected 400, got %d", w.Code)
+	if w.Code != 404 {
+		t.Errorf("inject on unknown task expected 404, got %d", w.Code)
 	}
 }
 

@@ -145,9 +145,10 @@ func New(cfg Config) (*Manager, error) {
 	if cfg.LogDir == "" {
 		cfg.LogDir = filepath.Join(os.TempDir(), "agent-router-llama-logs")
 	}
-	if err := os.MkdirAll(cfg.LogDir, 0o755); err != nil {
+	if err := os.MkdirAll(cfg.LogDir, 0o700); err != nil {
 		return nil, fmt.Errorf("modelmgr: mkdir log dir: %w", err)
 	}
+	_ = os.Chmod(cfg.LogDir, 0o700)
 	return &Manager{cfg: cfg, pending: make(map[Slot]PendingChanges)}, nil
 }
 
@@ -415,7 +416,26 @@ func buildLlamaArgs(cfg ModelConfig) []string {
 		args = append(args, "-ngl", strconv.Itoa(cfg.NGpuLayers))
 	}
 	if cfg.KvCache != "" {
-		args = append(args, "-ctk", cfg.KvCache, "-ctv", cfg.KvCache)
+		// Only add -ctk / -ctv from the KvCache field if ExtraArgs hasn't
+		// already supplied them. llama-server takes the LAST occurrence of
+		// a flag, so without this dedup an ExtraArgs entry like
+		// `-ctk q8_0 -ctv turbo3` would silently override the explicit
+		// KvCache value -- the user-facing field would look ignored.
+		hasCtk, hasCtv := false, false
+		for _, a := range cfg.ExtraArgs {
+			switch a {
+			case "-ctk":
+				hasCtk = true
+			case "-ctv":
+				hasCtv = true
+			}
+		}
+		if !hasCtk {
+			args = append(args, "-ctk", cfg.KvCache)
+		}
+		if !hasCtv {
+			args = append(args, "-ctv", cfg.KvCache)
+		}
 	}
 	args = append(args, cfg.ExtraArgs...)
 	return args
@@ -425,7 +445,9 @@ func (m *Manager) start(ctx context.Context, slot Slot, cfg ModelConfig) error {
 	args := buildLlamaArgs(cfg)
 
 	logPath := filepath.Join(m.cfg.LogDir, fmt.Sprintf("llama-%s.log", slot))
-	logFile, err := os.Create(logPath)
+	// SEC-PASS5-005: 0o600 daemon log; llama-server stdout/stderr can echo
+	// prompts and model output, not for other local users on shared hosts.
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
 	if err != nil {
 		return fmt.Errorf("modelmgr: create log: %w", err)
 	}
@@ -450,7 +472,15 @@ func (m *Manager) start(ctx context.Context, slot Slot, cfg ModelConfig) error {
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 	cmd.Env = env
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	// Setpgid: own process group so Kill(-pgid) takes the whole tree.
+	// Pdeathsig: SIGKILL the child if the parent (this daemon) dies. Belt
+	// and suspenders against a daemon crash where Shutdown never gets to
+	// run; without this, a llama-server child can outlive the daemon and
+	// keep its port + GPU buffers pinned.
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Setpgid:   true,
+		Pdeathsig: syscall.SIGKILL,
+	}
 
 	if err := cmd.Start(); err != nil {
 		logFile.Close()
@@ -525,13 +555,37 @@ func (m *Manager) stop() error {
 		return nil
 	case <-t.C:
 		_ = syscall.Kill(-pgid, syscall.SIGKILL)
-		<-done
+		// Bound the post-SIGKILL wait. If the child is in uninterruptible
+		// sleep (D state, e.g. stuck on a kernel/driver call), cmd.Wait()
+		// can block forever and stall daemon shutdown indefinitely. Drop the
+		// reference after the grace period and surface a stderr warning so
+		// the operator notices the orphan.
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			fmt.Fprintf(os.Stderr,
+				"modelmgr: child pid %d did not reap after SIGKILL; "+
+					"orphaning (likely D-state)\n", pgid)
+		}
 		return nil
 	}
 }
 
 // Shutdown tears down whatever is currently running. Call on daemon exit.
+//
+// Acquires swapMu so an in-flight EnsureSlot finishes (or its caller's ctx
+// has already been cancelled) before we try to stop the process. Without
+// this, a Shutdown that runs while EnsureSlot is mid-start() could observe
+// m.cmd == nil at the start() boundary, return without killing anything,
+// and then EnsureSlot would write m.cmd = cmd just before main exits --
+// leaving the llama-server child orphaned with its port and GPU pinned.
+//
+// The Pdeathsig set in start() is the second line of defence: even if a
+// future caller races past Shutdown, the kernel will SIGKILL the child
+// when the daemon process exits.
 func (m *Manager) Shutdown() error {
+	m.swapMu.Lock()
+	defer m.swapMu.Unlock()
 	return m.stop()
 }
 

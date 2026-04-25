@@ -12,11 +12,11 @@ func TestExpandUserPath(t *testing.T) {
 		t.Skip("no home dir")
 	}
 	t.Setenv("HOME", home)
-	t.Setenv("AR_TEST_ROOT", "/tmp/ar-test")
-	// Ensure NOPE_NOT_SET is actually unset for the "unknown var collapses
-	// to empty" assertion to hold. t.Setenv guarantees restoration.
-	t.Setenv("NOPE_NOT_SET", "")
-	os.Unsetenv("NOPE_NOT_SET")
+	// Set a sentinel value we can use to confirm that $VAR substitution
+	// is NOT performed (security: env-var exfil via repo_root). If
+	// expandUserPath ever re-introduces os.ExpandEnv, the assertions
+	// below will fail.
+	t.Setenv("AR_TEST_SECRET", "leaked-value")
 
 	cases := []struct {
 		in   string
@@ -27,13 +27,14 @@ func TestExpandUserPath(t *testing.T) {
 		{"relative/path", "relative/path"},
 		{"~", home},
 		{"~/Projects/observatory", home + "/Projects/observatory"},
-		{"$HOME/Projects/x", home + "/Projects/x"},
-		{"${HOME}/Projects/x", home + "/Projects/x"},
-		{"$AR_TEST_ROOT/sub", "/tmp/ar-test/sub"},
 		// ~ not at start is a literal
 		{"/tmp/~user/x", "/tmp/~user/x"},
-		// Unknown var collapses to empty (matches os.ExpandEnv)
-		{"$NOPE_NOT_SET/x", "/x"},
+		// $VAR / ${VAR} tokens are intentionally left LITERAL so their
+		// values cannot be exfiltrated through error messages.
+		{"$HOME/Projects/x", "$HOME/Projects/x"},
+		{"${HOME}/Projects/x", "${HOME}/Projects/x"},
+		{"$AR_TEST_SECRET", "$AR_TEST_SECRET"},
+		{"${AR_TEST_SECRET}/sub", "${AR_TEST_SECRET}/sub"},
 	}
 	for _, c := range cases {
 		got, err := expandUserPath(c.in)

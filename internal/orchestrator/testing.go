@@ -33,3 +33,18 @@ func SeedRunningForTest(o *Orchestrator, store *taskstore.Store) (string, error)
 	o.mu.Unlock()
 	return id, nil
 }
+
+// SeedTerminalForTest persists a task in a terminal status (succeeded /
+// failed / aborted) but does NOT register it in the running map. Used by
+// tests that exercise the 409 Conflict path on /inject and /abort.
+func SeedTerminalForTest(store *taskstore.Store, status taskstore.Status) (string, error) {
+	id := "term-" + newTaskID()
+	task := &taskstore.Task{
+		ID:     id,
+		Status: status,
+	}
+	if err := store.Save(task); err != nil {
+		return "", err
+	}
+	return id, nil
+}
