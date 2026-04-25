@@ -1191,6 +1191,25 @@ func (o *Orchestrator) executeROTool(ctx context.Context, st *runState, tb *tool
 			st.lastTestFailed = false
 		}
 		st.workOps++
+		// AUTO-EXTRACT-AND-COMMIT: parse `# file: <path>` markdown-fenced
+		// code blocks from the coder's reply and write them via the
+		// toolbox. Observed in rematch #5 with Qwen3-Coder-30B-A3B: the
+		// coder produced excellent multi-file responses (18-20 KB blocks
+		// with proper `# file:` markers), but the reviewer (Gemma-4-26B)
+		// hallucinated progress (`I have implemented the API`) and
+		// dispatched ask_coder again instead of extracting and writing
+		// the files. Doing the extract here removes that failure mode
+		// from the reviewer's plate entirely.
+		//
+		// Write errors are surfaced back to the model in the result so it
+		// can decide what to do (most often: ask_coder again with a
+		// narrower instruction). Successes are summarized as a leading
+		// "AUTO-COMMITTED: ..." line; the full coder reply still follows
+		// so the reviewer can read the prose for context.
+		commitSummary := autoExtractAndCommit(tb, code)
+		if commitSummary != "" {
+			return commitSummary + "\n\n" + code, nil
+		}
 		return code, nil
 
 	case "fs.read":
@@ -1723,8 +1742,11 @@ Workflow (you decide the order at each step):
   3. When you have a plan you like, call ask_coder with the plan and any
      extra instructions (e.g. target files, test commands).
   4. The coder returns code as markdown-fenced blocks with a
-     "# file: <path>" comment on the first line inside each fence.
-     Extract each file and call fs.write to commit it.
+     "# file: <path>" comment on the first line inside each fence. The
+     orchestrator AUTO-COMMITS every such block to disk; you will see a
+     leading "AUTO-COMMITTED N file(s)" summary in the result. Do NOT
+     re-extract or fs.write those files yourself; they are already on
+     disk. Use fs.read or test.run on the next turn to verify.
   5. After writing, call test.run. If tests pass, call done(summary).
      If tests fail, inspect the output. Decide whether to:
         - Call ask_coder again (the coder gets fs.read access on retry)
@@ -2011,6 +2033,130 @@ func stripToolTags(s string) string {
 	s = toolTagClose.ReplaceAllString(s, "")
 	s = toolTagOpen.ReplaceAllString(s, "")
 	return strings.TrimSpace(s)
+}
+
+// codeFenceRE matches a markdown code fence: opening ``` with optional
+// language tag, then content, then closing ```. The content group is
+// captured. We use a non-greedy match so adjacent fences don't collapse.
+var codeFenceRE = regexp.MustCompile("(?s)```[a-zA-Z0-9_+\\-]*\\s*\\n?(.*?)```")
+
+// fileMarkerRE matches the `# file: <path>` or `// file: <path>` line
+// the coder uses to name a file inside a code fence. Extracted from
+// rematch #5 traces against Qwen3-Coder-30B-A3B and gpt-oss-20b: both
+// emit `# file: foo.ts` as the first line inside a fence, sometimes
+// preceded by whitespace.
+var fileMarkerRE = regexp.MustCompile(`(?m)^\s*(?:#|//)\s*file:\s*([^\s\n]+)\s*$`)
+
+// codeFileExtraction is a parsed (path, content) pair extracted from a
+// markdown-fenced code block in the coder's reply.
+type codeFileExtraction struct {
+	Path    string
+	Content string
+}
+
+// extractFileBlocks walks a coder reply and returns every (path, content)
+// pair where the fence content begins with a `# file: <path>` marker.
+// Files without the marker are skipped (the coder might emit examples or
+// snippets the reviewer should read but not commit).
+func extractFileBlocks(reply string) []codeFileExtraction {
+	matches := codeFenceRE.FindAllStringSubmatch(reply, -1)
+	out := make([]codeFileExtraction, 0, len(matches))
+	for _, m := range matches {
+		if len(m) < 2 {
+			continue
+		}
+		body := m[1]
+		marker := fileMarkerRE.FindStringSubmatch(body)
+		if marker == nil {
+			continue
+		}
+		// Strip the file-marker line from the body so the file written
+		// to disk is just the code.
+		path := strings.TrimSpace(marker[1])
+		if path == "" {
+			continue
+		}
+		// Reject anything that looks suspicious as a path: absolute
+		// paths and parent-directory traversal are rejected at the
+		// toolbox layer too, but failing fast here means the reviewer
+		// sees a clear "skipped" entry instead of an error.
+		if strings.HasPrefix(path, "/") || strings.Contains(path, "..") {
+			continue
+		}
+		// Cut everything from the start of the body up to and including
+		// the marker line's trailing newline.
+		bodyOut := body
+		if idx := fileMarkerRE.FindStringIndex(body); idx != nil {
+			bodyOut = body[idx[1]:]
+			// Drop one leading newline if present so the file content
+			// doesn't start with a blank line.
+			bodyOut = strings.TrimPrefix(bodyOut, "\n")
+		}
+		out = append(out, codeFileExtraction{
+			Path:    path,
+			Content: bodyOut,
+		})
+	}
+	return out
+}
+
+// autoExtractAndCommit parses `# file:`-marked code blocks from the
+// coder's reply and commits each one via the toolbox's FSWrite. Returns
+// a human-readable summary of what was committed (or empty string if no
+// extractable blocks were found). Errors during individual writes are
+// included in the summary; the operation is best-effort and does not
+// abort on the first error.
+//
+// Why this exists: the spec assigns extract-and-commit to the reviewer,
+// but in practice reviewer models with weaker instruction-following
+// (Gemma-4-26B at IQ4_XS, observed in rematch #5) hallucinate progress
+// instead of running the extract-and-write loop. Doing it here
+// guarantees the artifact lands on disk regardless of reviewer behavior.
+func autoExtractAndCommit(tb *toolbox.Toolbox, reply string) string {
+	files := extractFileBlocks(reply)
+	if len(files) == 0 {
+		return ""
+	}
+	var committed []string
+	var failed []string
+	for _, f := range files {
+		// Cap each individual write at the same byte budget the manual
+		// fs.write tool enforces. Coder replies that try to dump
+		// megabytes of code into a single file are almost always a
+		// hallucination; reject those rather than corrupt the repo.
+		if len(f.Content) > fsWriteMaxBytes {
+			failed = append(failed, fmt.Sprintf("%s: content exceeds %d-byte cap", f.Path, fsWriteMaxBytes))
+			continue
+		}
+		res, err := tb.FSWrite(f.Path, f.Content)
+		if err != nil {
+			failed = append(failed, fmt.Sprintf("%s: %v", f.Path, err))
+			continue
+		}
+		what := "new"
+		if !res.Created {
+			what = "overwritten"
+		}
+		committed = append(committed, fmt.Sprintf("%s (%d bytes, %s)", res.Path, res.Bytes, what))
+	}
+	var b strings.Builder
+	if len(committed) > 0 {
+		b.WriteString(fmt.Sprintf("AUTO-COMMITTED %d file(s) from coder reply:\n", len(committed)))
+		for _, c := range committed {
+			b.WriteString("  - ")
+			b.WriteString(c)
+			b.WriteString("\n")
+		}
+	}
+	if len(failed) > 0 {
+		b.WriteString(fmt.Sprintf("AUTO-COMMIT FAILED for %d file(s):\n", len(failed)))
+		for _, f := range failed {
+			b.WriteString("  - ")
+			b.WriteString(f)
+			b.WriteString("\n")
+		}
+	}
+	return strings.TrimRight(b.String(), "\n")
 }
 
 // shortenArgs returns a trimmed copy of args suitable for trace logging.
