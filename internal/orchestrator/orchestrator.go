@@ -93,20 +93,33 @@ const (
 	MaxTokensAll = 24576
 
 	// Per-role max_tokens caps. The reviewer's job each turn is to
-	// emit a short prose preamble plus one <TOOL>...</TOOL> block;
-	// that fits in 2K tokens with comfortable headroom. With the
-	// global 24K cap, the reviewer routinely generated 5K-tokens-
-	// and-counting summaries BEFORE emitting the tool call, eating
-	// ~10 minutes per turn at gemma-4-26B's 13 tok/s long-context
-	// decode rate (rematch #6). Capping at 2K forces concise turns
-	// without losing the reasoning preamble entirely.
+	// emit a short prose preamble plus one <TOOL>...</TOOL> block.
+	// 4K balances "force concise turns" with "leave enough headroom
+	// to actually finish emitting the tool call." Rematch #6 with
+	// the global 24K cap had reviewer turns running ~10 minutes;
+	// rematch #7 at 2K saw the reviewer get cut off mid-tool-call
+	// (5 no_tool_call nudges in 19 LLM calls). 4K threads the
+	// needle: long-context decode at gemma-4-26B's ~30 tok/s gives
+	// roughly 2 minutes per turn, and the tool-call envelope plus
+	// args fit comfortably.
 	//
 	// The planner emits structured plans that occasionally need
 	// more room; 8K is a comfortable budget. The coder emits multi-
 	// file code blocks that legitimately fill the high cap.
-	MaxTokensReviewer = 2048
+	MaxTokensReviewer = 4096
 	MaxTokensPlanner  = 8192
 	MaxTokensCoder    = 24576
+
+	// maxPensiveSearchCalls caps how many pensive.search dispatches
+	// a single task may make. Observed in rematch #6 + #7: the
+	// reviewer over-uses pensive.search as a "verify the previous
+	// result" reflex, dispatching 5-8 calls in a row instead of
+	// reading <RESULT> blocks already in context. After this many
+	// calls, the dispatcher rejects further pensive.search with a
+	// structured error nudging the model toward fs.read / test.run
+	// or done. Three is generous: a real session needs at most
+	// "search before plan, search before commit, search before done".
+	maxPensiveSearchCalls = 3
 
 	// Default RO loop caps. All overridable via Config.
 	DefaultMaxROTurns       = 40
@@ -225,9 +238,10 @@ type runState struct {
 	abortRequested atomic.Bool
 
 	// Tool budget counters.
-	askCoderCalls    int
-	askPlannerCalls  int
-	roTurns          int
+	askCoderCalls      int
+	askPlannerCalls    int
+	pensiveSearchCalls int
+	roTurns            int
 
 	// workOps counts "real work" tool invocations so the done() guard can
 	// reject premature termination. Increments on ask_coder, fs.write,
@@ -1362,6 +1376,17 @@ func (o *Orchestrator) executeROTool(ctx context.Context, st *runState, tb *tool
 			r.ExitCode, shorten(r.Stdout, 4000), shorten(r.Stderr, 2000)), nil
 
 	case "pensive.search":
+		// Hard cap: reviewers tend to over-call pensive.search as a
+		// reflex (rematch #6 saw 5 calls back-to-back, rematch #7
+		// hit 8). After maxPensiveSearchCalls, refuse with a
+		// structured nudge so the model picks a different action.
+		// Three calls is generous; if the model needs more memory
+		// access, it can ask the human via fail() with a clear
+		// reason.
+		if st.pensiveSearchCalls >= maxPensiveSearchCalls {
+			return "", fmt.Errorf("pensive.search: budget exhausted (%d calls already this task). Tool results from earlier turns are still in your context as <RESULT>...</RESULT> blocks; re-read those instead. Pick a different action: ask_coder, fs.write, fs.read, test.run, or done", maxPensiveSearchCalls)
+		}
+		st.pensiveSearchCalls++
 		q := argStr("query")
 		k, err := argInt("k", 5)
 		if err != nil {
