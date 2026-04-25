@@ -87,9 +87,26 @@ func IsTerminal(s taskstore.Status) bool {
 // --- shared budgets --------------------------------------------------------
 
 const (
-	// MaxTokensAll is the max_tokens sent on every ChatRequest. Consistent
-	// 24576 across P, C, RO per the brief.
+	// MaxTokensAll is a legacy global cap. Current code uses the
+	// per-role caps below; this constant is kept for any external
+	// caller that still references it.
 	MaxTokensAll = 24576
+
+	// Per-role max_tokens caps. The reviewer's job each turn is to
+	// emit a short prose preamble plus one <TOOL>...</TOOL> block;
+	// that fits in 2K tokens with comfortable headroom. With the
+	// global 24K cap, the reviewer routinely generated 5K-tokens-
+	// and-counting summaries BEFORE emitting the tool call, eating
+	// ~10 minutes per turn at gemma-4-26B's 13 tok/s long-context
+	// decode rate (rematch #6). Capping at 2K forces concise turns
+	// without losing the reasoning preamble entirely.
+	//
+	// The planner emits structured plans that occasionally need
+	// more room; 8K is a comfortable budget. The coder emits multi-
+	// file code blocks that legitimately fill the high cap.
+	MaxTokensReviewer = 2048
+	MaxTokensPlanner  = 8192
+	MaxTokensCoder    = 24576
 
 	// Default RO loop caps. All overridable via Config.
 	DefaultMaxROTurns       = 40
@@ -859,7 +876,7 @@ func (o *Orchestrator) roLoop(ctx context.Context, st *runState, tb *toolbox.Too
 		resp, err := o.cfg.ModelMgr.Complete(ctx, modelmgr.ChatRequest{
 			Messages:    messages,
 			Temperature: 0.2,
-			MaxTokens:   MaxTokensAll,
+			MaxTokens:   MaxTokensReviewer,
 		})
 		if err != nil {
 			return "", false, fmt.Errorf("ro turn %d: %w", st.roTurns, err)
@@ -1442,7 +1459,7 @@ func (o *Orchestrator) callPlanner(ctx context.Context, st *runState, tb *toolbo
 		resp, err := o.cfg.ModelMgr.Complete(ctx, modelmgr.ChatRequest{
 			Messages:    messages,
 			Temperature: 0.2,
-			MaxTokens:   MaxTokensAll,
+			MaxTokens:   MaxTokensPlanner,
 		})
 		if err != nil {
 			return "", fmt.Errorf("planner turn %d: %w", i, err)
@@ -1516,7 +1533,7 @@ func (o *Orchestrator) callCoder(ctx context.Context, st *runState, tb *toolbox.
 		resp, err := o.cfg.ModelMgr.Complete(ctx, modelmgr.ChatRequest{
 			Messages:    messages,
 			Temperature: 0.1,
-			MaxTokens:   MaxTokensAll,
+			MaxTokens:   MaxTokensCoder,
 		})
 		if err != nil {
 			return "", fmt.Errorf("coder turn %d: %w", i, err)
