@@ -1644,6 +1644,10 @@ Rules:
     review verdict, a routing call between planner and coder, committing
     a file that looks unusual), you may call pensive.search to pull
     relevant prior atoms. Retrieval is cheap (single-digit ms).
+    DO NOT call pensive.search on the very first turn of a fresh task,
+    or to "retrieve" the result of a previous tool call. Tool results
+    are already in your context as <RESULT>...</RESULT> blocks; reread
+    them. pensive.search is for cross-task/cross-session memory only.
   - Memory accretion via pensive.emit_atom: after a decision where you
     noticed something non-obvious and transferable, emit an atom so a
     future version of you can retrieve the lesson. Emit sparingly and

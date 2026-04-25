@@ -22,6 +22,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -717,10 +718,43 @@ type chatResponse struct {
 	Choices []chatChoice `json:"choices"`
 }
 
-// Complete returns the assistant message text.
+// Complete returns the assistant message text. On a connection error
+// (the child llama-server died between requests) Complete will respawn
+// the active slot ONCE and retry; if the retry also hits a connection
+// error, the error propagates so the orchestrator can fail the task.
 func (m *Manager) Complete(ctx context.Context, req ChatRequest) (string, error) {
 	release := m.markGenerating()
 	defer release()
+	out, err := m.completeAttempt(ctx, req)
+	if err == nil {
+		return out, nil
+	}
+	if !isChildDeadError(err) {
+		return "", err
+	}
+	// Child llama-server is unreachable. Respawn the active slot once.
+	m.mu.Lock()
+	deadSlot := m.activeSlot
+	m.mu.Unlock()
+	if deadSlot == "" {
+		return "", err
+	}
+	fmt.Fprintf(os.Stderr, "modelmgr: slot %s child dead (%v); respawning once\n", deadSlot, err)
+	// stop() clears m.cmd and m.port so EnsureSlot's "already loaded"
+	// fast path doesn't fire. We discard stop's error: the child is
+	// already dead, kill failures are expected.
+	_ = m.stop()
+	if _, err := m.EnsureSlot(ctx, deadSlot); err != nil {
+		return "", fmt.Errorf("modelmgr: respawn after child death: %w", err)
+	}
+	// Second attempt. If THIS one fails for any reason, surface it.
+	return m.completeAttempt(ctx, req)
+}
+
+// completeAttempt does one round of slot-config lookup + HTTP POST to
+// /v1/chat/completions. Split out from Complete so the respawn-once
+// retry can call it twice without duplicating sampling-default logic.
+func (m *Manager) completeAttempt(ctx context.Context, req ChatRequest) (string, error) {
 	m.mu.Lock()
 	port := m.port
 	activeSlot := m.activeSlot
@@ -782,13 +816,90 @@ func (m *Manager) Complete(ctx context.Context, req ChatRequest) (string, error)
 	}
 	msg := out.Choices[0].Message
 	if msg.Content != "" {
-		return msg.Content, nil
+		return scrubChatTemplateTokens(msg.Content), nil
 	}
 	// Reasoning model emitted everything inside <think>. llama.cpp pulls
 	// that into reasoning_content; use it as a fallback so the orchestrator
 	// has something to parse.
 	if msg.ReasoningContent != "" {
-		return msg.ReasoningContent, nil
+		return scrubChatTemplateTokens(msg.ReasoningContent), nil
 	}
 	return "", fmt.Errorf("llama-server: empty content (finish=%s)", out.Choices[0].FinishReason)
+}
+
+// isChildDeadError matches the error shapes net/http returns when the
+// upstream llama-server child has exited or its socket has closed:
+// "connection refused" (child gone before we connect),
+// "connection reset by peer" (child died mid-handshake),
+// "EOF" / "unexpected EOF" (child closed the response prematurely).
+//
+// We do NOT respawn on context cancellation, on TLS errors, or on
+// HTTP-level failures (non-200 status). Those have different fix
+// paths and a respawn would mask them.
+func isChildDeadError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	for _, marker := range []string{
+		"connection refused",
+		"connection reset by peer",
+		"broken pipe",
+		"EOF",
+	} {
+		if strings.Contains(s, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// chatTemplateTokenRE matches Gemma / GPT-OSS / similar special-token
+// sequences of the form `<|whatever|>` plus the malformed variants
+// `<|whatever>` (missing closing pipe) and `<whatever|>` (missing opening
+// pipe) that hallucinated reviewers occasionally emit. Strips the entire
+// token. Anything inside is treated as a literal token name (no spaces,
+// no angle brackets).
+var chatTemplateTokenRE = regexp.MustCompile(`<\|?[A-Za-z0-9_]+\|?>`)
+
+// scrubChatTemplateTokens removes bare chat-template tokens from a
+// completion response before it enters the conversation history.
+//
+// Background: rematch #2 of the TraceForge A/B died at turn 24 because
+// the Gemma-4-26B-A4B-IQ4_XS reviewer hallucinated a malformed
+// `<|channel>\n\n` at the start of a turn. That string went back into
+// the next /v1/chat/completions request as a prior assistant message;
+// llama-server's chat parser treated `<|channel>` as a special-token
+// prefix, found no closing `|>`, and rejected the whole request with
+// HTTP 500.
+//
+// We only scrub the SHAPE that triggered the parser bug. The legitimate
+// `<TOOL>...</TOOL>` envelope and `<RESULT>...</RESULT>` markers are
+// SAFE -- they are plain ASCII tags without the leading `|` and the
+// regex below requires either `<|` or `<` immediately followed by a
+// name AND a closing `|>` or `>`. `<TOOL>` matches `<NAME>` shape, so
+// to keep TOOL/RESULT tags intact we whitelist them explicitly.
+//
+// Returning a copy with the bad tokens removed is enough to break the
+// re-injection chain. The model's NEXT turn sees the prose-without-the-
+// hallucinated-token and the parser stays happy.
+func scrubChatTemplateTokens(s string) string {
+	if !strings.Contains(s, "<") {
+		return s
+	}
+	return chatTemplateTokenRE.ReplaceAllStringFunc(s, func(tok string) string {
+		// Whitelist plain envelopes. The orchestrator uses these as
+		// the tool-call boundary; the parser depends on them.
+		switch tok {
+		case "<TOOL>", "</TOOL>", "<RESULT>", "</RESULT>",
+			"<ERROR>", "</ERROR>", "<think>", "</think>",
+			"<TOOL_LITERAL>", "</TOOL_LITERAL>",
+			"<RESULT_LITERAL>", "</RESULT_LITERAL>",
+			"<ERROR_LITERAL>", "</ERROR_LITERAL>":
+			return tok
+		}
+		// Strip everything else (including malformed variants like
+		// `<|channel>` with the missing closing pipe).
+		return ""
+	})
 }
