@@ -436,6 +436,26 @@ func buildLlamaArgs(cfg ModelConfig) []string {
 	if cfg.NGpuLayers != 0 {
 		args = append(args, "-ngl", strconv.Itoa(cfg.NGpuLayers))
 	}
+	// Disable llama-server's --fit auto-sizing probe. We always supply
+	// explicit -c and -ngl (and the operator picked them deliberately
+	// for VRAM headroom), so the fit probe contributes nothing useful
+	// here -- it just adds 1-3 seconds of startup latency. Worse, on
+	// some model architectures (gpt-oss-20b's openai_moe_iswa, observed
+	// 2026-04-25) the temporary llama_context the fit code constructs
+	// crashes inside ggml_reshape_3d during build_attn for kv_iswa,
+	// killing the spawn before the real model ever loads. Operators
+	// who want auto-sizing back can set "-fit on" in ExtraArgs, which
+	// llama-server's last-flag-wins arg parsing will honor.
+	hasFitFlag := false
+	for _, a := range cfg.ExtraArgs {
+		if a == "-fit" || a == "--fit" {
+			hasFitFlag = true
+			break
+		}
+	}
+	if !hasFitFlag {
+		args = append(args, "-fit", "off")
+	}
 	if cfg.KvCache != "" {
 		// Only add -ctk / -ctv from the KvCache field if ExtraArgs hasn't
 		// already supplied them. llama-server takes the LAST occurrence of
