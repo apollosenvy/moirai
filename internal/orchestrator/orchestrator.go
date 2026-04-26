@@ -47,6 +47,7 @@ import (
 
 	"github.com/aegis/agent-router/internal/aegis"
 	"github.com/aegis/agent-router/internal/modelmgr"
+	"github.com/aegis/agent-router/internal/plan"
 	"github.com/aegis/agent-router/internal/repoconfig"
 	"github.com/aegis/agent-router/internal/taskstore"
 	"github.com/aegis/agent-router/internal/toolbox"
@@ -260,6 +261,18 @@ type runState struct {
 	// Last emitted plan (for context when RO calls ask_coder without
 	// passing one, and for L2 persistence).
 	lastPlan string
+
+	// Structured plan parsed from the planner's reply. Populated on the
+	// first successful ask_planner call. Drives the <CHECKLIST> block
+	// injected into every reviewer turn and the done() gate.
+	// nil if the planner has not (yet) emitted parseable JSON.
+	plan *plan.Plan
+
+	// lastChecklistRendered is the most recent <CHECKLIST> block we
+	// injected. Used to suppress duplicate injections turn-over-turn
+	// when nothing has changed.
+	lastChecklistRendered string
+
 	// Flag: has a test.run failed since the last ask_coder? If so, the next
 	// ask_coder should get fs.read + fs.search access.
 	lastTestFailed bool
@@ -887,6 +900,25 @@ func (o *Orchestrator) roLoop(ctx context.Context, st *runState, tb *toolbox.Too
 			tr.Emit(trace.KindSwap, map[string]any{"to": "reviewer", "reason": "ro_resume"})
 		}
 
+		// Inject the live <CHECKLIST> block when the structured plan has
+		// state to show AND it has CHANGED since we last injected. This
+		// avoids context bloat from re-emitting an unchanged checklist
+		// every turn while still keeping the reviewer's view current.
+		// Empty when no plan is loaded -- preserves legacy behavior for
+		// reviewers that never get a structured plan.
+		if cl := st.plan.RenderChecklist(); cl != "" && cl != st.lastChecklistRendered {
+			messages = append(messages, modelmgr.ChatMessage{
+				Role:    "user",
+				Content: cl,
+			})
+			st.lastChecklistRendered = cl
+			tr.Emit(trace.KindInfo, map[string]any{
+				"checklist_injected": true,
+				"turn":               st.roTurns,
+				"bytes":              len(cl),
+			})
+		}
+
 		resp, err := o.cfg.ModelMgr.Complete(ctx, modelmgr.ChatRequest{
 			Messages:    messages,
 			Temperature: 0.2,
@@ -965,6 +997,36 @@ func (o *Orchestrator) roLoop(ctx context.Context, st *runState, tb *toolbox.Too
 					"name":  "done",
 					"error": errMsg,
 					"turn":  st.roTurns,
+				})
+				messages = append(messages, modelmgr.ChatMessage{
+					Role:    "user",
+					Content: fmt.Sprintf("<ERROR>%s</ERROR>", errMsg),
+				})
+				continue
+			}
+			// Acceptance gate: when a structured plan was loaded, refuse
+			// done() until all acceptance items are satisfied. This is
+			// the hard "red means stop" backstop the harness needs --
+			// the reviewer can no longer claim "all done" while the
+			// checklist still has unchecked criteria. Plans without
+			// acceptance items skip this gate entirely (legacy task
+			// mode).
+			if unmet := st.plan.UnsatisfiedAcceptance(); len(unmet) > 0 {
+				var b strings.Builder
+				b.WriteString("cannot call done: the plan's acceptance criteria are not all satisfied. Unsatisfied:\n")
+				for _, u := range unmet {
+					b.WriteString("  - ")
+					b.WriteString(u)
+					b.WriteString("\n")
+				}
+				b.WriteString("Run test.run / compile.run / write the missing files (see <CHECKLIST>), then retry done.")
+				errMsg := b.String()
+				tr.Emit(trace.KindToolCall, map[string]any{
+					"kind":             "ro_tool_call",
+					"name":             "done",
+					"error":            "acceptance not satisfied",
+					"unsatisfied":      len(unmet),
+					"turn":             st.roTurns,
 				})
 				messages = append(messages, modelmgr.ChatMessage{
 					Role:    "user",
@@ -1191,23 +1253,44 @@ func (o *Orchestrator) executeROTool(ctx context.Context, st *runState, tb *tool
 		if instr == "" {
 			return "", fmt.Errorf("ask_planner: instruction required")
 		}
-		plan, err := o.callPlanner(ctx, st, tb, instr)
+		planText, err := o.callPlanner(ctx, st, tb, instr)
 		if err != nil {
 			return "", err
 		}
-		st.lastPlan = plan
-		st.task.Plan = plan
+		st.lastPlan = planText
+		st.task.Plan = planText
 		if err := o.cfg.Store.Save(st.task); err != nil {
 			st.trace.Emit(trace.KindInfo, map[string]any{
 				"save_error": err.Error(),
 				"context":    "ask_planner persist plan",
 			})
 		}
+		// Try to parse a structured Plan out of the planner's reply. The
+		// system prompt asks for a JSON block at the end; if present we
+		// store it on runState and start rendering the <CHECKLIST> block
+		// into every subsequent reviewer turn. A reply with no JSON is
+		// not an error -- the reviewer continues with prose-only plan
+		// (legacy behavior, pre-checklist) and st.plan stays nil.
+		if parsed, perr := plan.Parse(planText); perr != nil {
+			// Malformed JSON. Trace it and keep going; reviewer can ask
+			// the planner to retry on the next turn if needed.
+			st.trace.Emit(trace.KindInfo, map[string]any{
+				"plan_parse_error": perr.Error(),
+				"reply_bytes":      len(planText),
+			})
+		} else if parsed != nil {
+			st.plan = parsed
+			st.trace.Emit(trace.KindInfo, map[string]any{
+				"plan_parsed":      true,
+				"phases":           len(parsed.Phases),
+				"acceptance_items": len(parsed.Acceptance),
+			})
+		}
 		// ask_planner does NOT count toward workOps: the done() guard wants
 		// to see real progress (code, writes, tests), and a planner call alone
 		// could otherwise satisfy the guard for a model that emits plan->done
 		// with no implementation.
-		return plan, nil
+		return planText, nil
 
 	case "ask_coder":
 		if st.askCoderCalls >= o.cfg.MaxCoderRetries {
@@ -1248,7 +1331,7 @@ func (o *Orchestrator) executeROTool(ctx context.Context, st *runState, tb *tool
 		// narrower instruction). Successes are summarized as a leading
 		// "AUTO-COMMITTED: ..." line; the full coder reply still follows
 		// so the reviewer can read the prose for context.
-		commitSummary := autoExtractAndCommit(tb, code)
+		commitSummary := autoExtractAndCommit(tb, code, st)
 		if commitSummary != "" {
 			return commitSummary + "\n\n" + code, nil
 		}
@@ -1317,6 +1400,15 @@ func (o *Orchestrator) executeROTool(ctx context.Context, st *runState, tb *tool
 			st.fsWriteHistory = st.fsWriteHistory[len(st.fsWriteHistory)-fsWriteHistoryLen:]
 		}
 		st.consecutiveFsWrites++
+		// Tick the file off the structured plan (if loaded) and any
+		// "verify: file:<path>" acceptance items. No-op when st.plan
+		// is nil.
+		if n := st.plan.MarkFileWritten(path); n > 0 {
+			st.trace.Emit(trace.KindInfo, map[string]any{
+				"checklist_ticked": n,
+				"path":             path,
+			})
+		}
 		// The result string is what the RO reads as the tool return. Historical
 		// form used `created=%v` which reasoning models misread as failure when
 		// overwriting an existing file (the observed loop was Gemma-4-A4B
@@ -1373,6 +1465,13 @@ func (o *Orchestrator) executeROTool(ctx context.Context, st *runState, tb *tool
 			st.lastTestFailed = true
 		} else {
 			st.lastTestFailed = false
+			// Tick acceptance items with verify="test.run:pass".
+			if n := st.plan.MarkAcceptance("test.run:pass"); n > 0 {
+				st.trace.Emit(trace.KindInfo, map[string]any{
+					"checklist_ticked": n,
+					"verify":           "test.run:pass",
+				})
+			}
 		}
 		st.workOps++
 		return out, nil
@@ -1383,6 +1482,14 @@ func (o *Orchestrator) executeROTool(ctx context.Context, st *runState, tb *tool
 			return "", err
 		}
 		st.workOps++
+		if r.ExitCode == 0 {
+			if n := st.plan.MarkAcceptance("compile.run:pass"); n > 0 {
+				st.trace.Emit(trace.KindInfo, map[string]any{
+					"checklist_ticked": n,
+					"verify":           "compile.run:pass",
+				})
+			}
+		}
 		return fmt.Sprintf("exit=%d\nstdout:\n%s\nstderr:\n%s",
 			r.ExitCode, shorten(r.Stdout, 4000), shorten(r.Stderr, 2000)), nil
 
@@ -1697,6 +1804,61 @@ Rules:
     This is optional; the plan text in your reply itself is what matters.
   - You have NO other tools. Do not attempt fs.read, fs.search, test.run,
     shell.exec, or anything else. Only fs.write to PLAN.md is allowed.
+
+STRUCTURED OUTPUT (REQUIRED at end of reply):
+
+After your prose plan, you MUST append a fenced JSON block describing the
+plan in machine-readable form. The orchestrator parses it to drive a live
+checklist the Reviewer sees on every turn AND to gate the done() tool on
+real completion. Without this block, the Reviewer flies blind.
+
+Schema:
+  {
+    "phases": [
+      {
+        "id":   "P1",                                  // short identifier
+        "name": "Scaffold",                            // human-readable phase name
+        "files": [
+          {"path": "package.json", "purpose": "..."},  // path is REPO-RELATIVE
+          {"path": "src/server.ts"}
+        ]
+      },
+      ...
+    ],
+    "acceptance": [
+      {
+        "id":          "A1",
+        "description": "npm install completes with exit 0",
+        "verify":      ""                              // empty = manual claim
+      },
+      {
+        "id":          "A2",
+        "description": "tsc --noEmit passes",
+        "verify":      "compile.run:pass"              // auto-tick when compile.run exits 0
+      },
+      {
+        "id":          "A3",
+        "description": "fixtures/sample.jsonl present",
+        "verify":      "file:fixtures/sample.jsonl"    // auto-tick when fs.write lands at this path
+      }
+    ]
+  }
+
+Supported "verify" values:
+  - ""                     informational only; reviewer must claim later
+  - "file:<repo-path>"     auto-tick when fs.write lands at <repo-path>
+  - "test.run:pass"        auto-tick when test.run exits 0
+  - "compile.run:pass"     auto-tick when compile.run exits 0
+
+Place the JSON in a fenced code block tagged json:
+
+  ` + "```json" + `
+  {"phases":[...], "acceptance":[...]}
+  ` + "```" + `
+
+The Reviewer-Orchestrator CANNOT call done() until every acceptance item
+is satisfied. Make your acceptance list realistic: 3-8 items typically.
+Each must be objectively verifiable.
 `
 }
 
@@ -2165,7 +2327,7 @@ func extractFileBlocks(reply string) []codeFileExtraction {
 // (Gemma-4-26B at IQ4_XS, observed in rematch #5) hallucinate progress
 // instead of running the extract-and-write loop. Doing it here
 // guarantees the artifact lands on disk regardless of reviewer behavior.
-func autoExtractAndCommit(tb *toolbox.Toolbox, reply string) string {
+func autoExtractAndCommit(tb *toolbox.Toolbox, reply string, st *runState) string {
 	files := extractFileBlocks(reply)
 	if len(files) == 0 {
 		return ""
@@ -2191,6 +2353,10 @@ func autoExtractAndCommit(tb *toolbox.Toolbox, reply string) string {
 			what = "overwritten"
 		}
 		committed = append(committed, fmt.Sprintf("%s (%d bytes, %s)", res.Path, res.Bytes, what))
+		// Tick the file off the structured plan (if loaded).
+		if st != nil {
+			_ = st.plan.MarkFileWritten(f.Path)
+		}
 	}
 	var b strings.Builder
 	if len(committed) > 0 {
