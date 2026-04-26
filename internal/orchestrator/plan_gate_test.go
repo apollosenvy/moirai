@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -238,6 +239,81 @@ func TestChecklistInjectionReplacesNotAppends(t *testing.T) {
 	}
 	if checklistCount != 1 {
 		t.Errorf("final messages should have exactly 1 <CHECKLIST>, got %d (replacement broken)", checklistCount)
+	}
+}
+
+// TestChecklistInjectionUsesCompactModeForLargePlans closes pass-3 finding
+// P3-MIN-2: the compact-render mode is unit-tested in plan_test.go but
+// never exercised via the actual roLoop checklist-injection path. This
+// test runs roLoop with a >50-file plan and asserts the injected message
+// uses the compact render shape ("Phase X -- name (n/m)" lines without
+// Purpose comments).
+func TestChecklistInjectionUsesCompactModeForLargePlans(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	store, _ := taskstore.Open(filepath.Join(t.TempDir(), "tasks"))
+
+	stub := &stubModelMgr{
+		responses: []string{
+			`<TOOL>{"name":"fail","args":{"reason":"end of test"}}</TOOL>`,
+		},
+	}
+	o, err := New(Config{Store: store, ModelMgr: stub})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	// Build a plan with > renderCompactThreshold (50) files. Include a
+	// Purpose comment on each file so we can assert it's dropped in
+	// compact mode.
+	var fileList []string
+	for i := 0; i < 60; i++ {
+		fileList = append(fileList, fmt.Sprintf(`{"path":"src/file%d.ts","purpose":"DROPME"}`, i))
+	}
+	planJSON := "```json\n" + `{"phases":[{"id":"P1","name":"Big","files":[` +
+		strings.Join(fileList, ",") + `]}],"acceptance":[]}` + "\n```"
+	p, err := plan.Parse(planJSON)
+	if err != nil || p == nil {
+		t.Fatalf("plan.Parse: %v", err)
+	}
+
+	id := "compact-mode-" + newTaskID()
+	task := &taskstore.Task{ID: id, Status: taskstore.StatusRunning, RepoRoot: t.TempDir()}
+	_ = store.Save(task)
+	tw, _ := trace.Open(id)
+	defer tw.Close()
+
+	st := &runState{
+		cancel:              func() {},
+		task:                task,
+		trace:               tw,
+		plan:                p,
+		workOps:             1,
+		lastChecklistMsgIdx: -1,
+	}
+
+	_, _, _ = o.roLoop(context.Background(), st, nil)
+
+	if len(stub.messages) == 0 {
+		t.Fatal("no Complete calls")
+	}
+	final := stub.messages[len(stub.messages)-1]
+	var checklistMsg string
+	for _, m := range final {
+		if strings.HasPrefix(m.Content, "<CHECKLIST>") {
+			checklistMsg = m.Content
+			break
+		}
+	}
+	if checklistMsg == "" {
+		t.Fatal("no <CHECKLIST> message found in messages")
+	}
+	// Compact-mode markers: phase summary line with (n/m) fraction.
+	if !strings.Contains(checklistMsg, "Phase P1 -- Big (0/60)") {
+		t.Errorf("checklist missing compact phase summary line; got: %q", checklistMsg[:200])
+	}
+	// Compact mode drops Purpose comments.
+	if strings.Contains(checklistMsg, "DROPME") {
+		t.Error("compact mode should drop Purpose comments")
 	}
 }
 
