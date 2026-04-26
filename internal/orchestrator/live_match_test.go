@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"bufio"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -181,6 +182,57 @@ func TestAutoExtractAndCommitLoopGuard(t *testing.T) {
 	}
 	if strings.Contains(final, "AUTO-COMMITTED 1 file") {
 		t.Errorf("file was committed despite duplicate guard: %q", final)
+	}
+}
+
+// TestAutoExtractAndCommitCapsReplyFileCount closes audit-pass-1 ADV-07:
+// a hallucinated coder reply with thousands of fenced blocks should not
+// flood the repo. The cap rejects everything past maxFilesPerCoderReply
+// and surfaces a structured nudge in the summary.
+func TestAutoExtractAndCommitCapsReplyFileCount(t *testing.T) {
+	repoRoot := t.TempDir()
+	tb, err := toolbox.New(repoRoot, "test-branch", t.TempDir(), repoconfig.Config{}, false)
+	if err != nil {
+		t.Fatalf("toolbox.New: %v", err)
+	}
+	t.Setenv("HOME", t.TempDir())
+	tw, _ := trace.Open("test-cap")
+	defer tw.Close()
+
+	st := &runState{
+		task:  &taskstore.Task{ID: "test-cap", RepoRoot: repoRoot},
+		trace: tw,
+	}
+
+	// Build a reply with maxFilesPerCoderReply + 5 fences. Each fence has
+	// a unique path. Expect exactly maxFilesPerCoderReply files committed
+	// and 5 rejected by cap.
+	var sb strings.Builder
+	for i := 0; i < maxFilesPerCoderReply+5; i++ {
+		sb.WriteString("```\n")
+		sb.WriteString(fmt.Sprintf("# file: f%d.txt\n", i))
+		sb.WriteString(fmt.Sprintf("content %d\n", i))
+		sb.WriteString("```\n\n")
+	}
+	summary := autoExtractAndCommit(tb, sb.String(), st)
+	if !strings.Contains(summary, fmt.Sprintf("AUTO-COMMITTED %d file(s)", maxFilesPerCoderReply)) {
+		t.Errorf("expected commit count = %d, got summary: %.200q", maxFilesPerCoderReply, summary)
+	}
+	if !strings.Contains(summary, "AUTO-COMMIT REJECTED 5 file(s)") {
+		t.Errorf("expected rejection message for 5 files, got: %.300q", summary)
+	}
+	// Verify only the first maxFilesPerCoderReply files actually landed.
+	for i := 0; i < maxFilesPerCoderReply; i++ {
+		full := filepath.Join(repoRoot, fmt.Sprintf("f%d.txt", i))
+		if _, err := os.Stat(full); err != nil {
+			t.Errorf("expected f%d.txt on disk: %v", i, err)
+		}
+	}
+	for i := maxFilesPerCoderReply; i < maxFilesPerCoderReply+5; i++ {
+		full := filepath.Join(repoRoot, fmt.Sprintf("f%d.txt", i))
+		if _, err := os.Stat(full); err == nil {
+			t.Errorf("f%d.txt should NOT have been written", i)
+		}
 	}
 }
 

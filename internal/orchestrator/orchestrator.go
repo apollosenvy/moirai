@@ -2909,10 +2909,26 @@ func validExtractionPath(path string) bool {
 // (Gemma-4-26B at IQ4_XS, observed in rematch #5) hallucinate progress
 // instead of running the extract-and-write loop. Doing it here
 // guarantees the artifact lands on disk regardless of reviewer behavior.
+// maxFilesPerCoderReply is the per-reply cap on the number of file
+// extractions autoExtractAndCommit will commit. Closes audit-pass-1
+// ADV-07: a hallucinating coder dumping thousands of fenced blocks
+// would have written all of them, bloating git history and stressing
+// the filesystem. 64 is plenty for a healthy multi-file phase emit
+// (rematch traces show real coders producing 5-15 files per turn at
+// peak); anything above the cap is rejected with a structured error
+// nudging the reviewer to re-prompt with a smaller scope.
+const maxFilesPerCoderReply = 64
+
 func autoExtractAndCommit(tb *toolbox.Toolbox, reply string, st *runState) string {
 	files := extractFileBlocks(reply)
 	if len(files) == 0 {
 		return ""
+	}
+	// ADV-07 cap: refuse a hallucinated megablast.
+	var rejectedByCap int
+	if len(files) > maxFilesPerCoderReply {
+		rejectedByCap = len(files) - maxFilesPerCoderReply
+		files = files[:maxFilesPerCoderReply]
 	}
 	var committed []string
 	var failed []string
@@ -2995,6 +3011,12 @@ func autoExtractAndCommit(tb *toolbox.Toolbox, reply string, st *runState) strin
 			b.WriteString(f)
 			b.WriteString("\n")
 		}
+	}
+	if rejectedByCap > 0 {
+		b.WriteString(fmt.Sprintf(
+			"AUTO-COMMIT REJECTED %d file(s) above the %d-per-reply cap. "+
+				"Re-prompt the coder with a narrower scope (one phase at a time).\n",
+			rejectedByCap, maxFilesPerCoderReply))
 	}
 	return strings.TrimRight(b.String(), "\n")
 }
