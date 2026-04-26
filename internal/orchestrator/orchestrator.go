@@ -2786,10 +2786,37 @@ func autoExtractAndCommit(tb *toolbox.Toolbox, reply string, st *runState) strin
 			failed = append(failed, fmt.Sprintf("%s: content exceeds %d-byte cap", f.Path, fsWriteMaxBytes))
 			continue
 		}
+		// Auto-extract loop guard: the explicit fs.write tool path has
+		// duplicateWriteCount + fsWriteRepeatCap (line ~1556) to refuse
+		// repeated writes of the same (path, content) pair, preventing
+		// the rematch-#3 "23-times-the-same-file" loop. Auto-extract
+		// previously bypassed that guard entirely; a coder dumping the
+		// same package.json on every turn would silently re-overwrite
+		// it. Apply the same guard here so loop detection covers BOTH
+		// write paths.
+		hash := contentHash(f.Content)
+		if st != nil {
+			if duplicateWriteCount(st.fsWriteHistory, f.Path, hash) >= fsWriteRepeatCap {
+				failed = append(failed, fmt.Sprintf(
+					"%s: rejected duplicate auto-extract (this content has been written %d+ times). The reviewer should call test.run / ask_coder for a different decision / done",
+					f.Path, fsWriteRepeatCap))
+				continue
+			}
+		}
 		res, err := tb.FSWrite(f.Path, f.Content)
 		if err != nil {
 			failed = append(failed, fmt.Sprintf("%s: %v", f.Path, err))
 			continue
+		}
+		// Record this write in the loop-detection ring. Identical to the
+		// explicit fs.write path's bookkeeping; both write paths share
+		// one history so a model alternating between them still trips
+		// the cap.
+		if st != nil {
+			st.fsWriteHistory = append(st.fsWriteHistory, fsWriteRecord{Path: res.Path, ContentHash: hash})
+			if len(st.fsWriteHistory) > fsWriteHistoryLen {
+				st.fsWriteHistory = st.fsWriteHistory[len(st.fsWriteHistory)-fsWriteHistoryLen:]
+			}
 		}
 		what := "new"
 		if !res.Created {

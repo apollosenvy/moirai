@@ -144,6 +144,46 @@ func TestAutoExtractAndCommitTicksPlan(t *testing.T) {
 	}
 }
 
+// TestAutoExtractAndCommitLoopGuard verifies that the auto-extract path
+// shares the explicit fs.write tool's loop-detection ring (fsWriteHistory)
+// so a coder repeatedly auto-extracting the same (path, content) pair gets
+// rejected after fsWriteRepeatCap repeats. Pre-fix the guard was only on
+// the explicit fs.write tool path and auto-extract bypassed it entirely.
+func TestAutoExtractAndCommitLoopGuard(t *testing.T) {
+	repoRoot := t.TempDir()
+	tb, err := toolbox.New(repoRoot, "test-branch", t.TempDir(), repoconfig.Config{}, false)
+	if err != nil {
+		t.Fatalf("toolbox.New: %v", err)
+	}
+	t.Setenv("HOME", t.TempDir())
+	tw, _ := trace.Open("test-loop-guard")
+	defer tw.Close()
+
+	st := &runState{
+		task:  &taskstore.Task{ID: "test-loop-guard", RepoRoot: repoRoot},
+		trace: tw,
+	}
+
+	// Same coder reply (same path, same content) repeated. After
+	// fsWriteRepeatCap (=3) successful writes, the next attempt must
+	// be REJECTED with a "duplicate auto-extract" message.
+	reply := "```\n# file: foo.txt\nhello world\n```\n"
+	for i := 0; i < fsWriteRepeatCap; i++ {
+		summary := autoExtractAndCommit(tb, reply, st)
+		if !strings.Contains(summary, "AUTO-COMMITTED 1 file") {
+			t.Errorf("attempt %d: expected commit, got: %q", i+1, summary)
+		}
+	}
+	// Next attempt -- guard should kick in.
+	final := autoExtractAndCommit(tb, reply, st)
+	if !strings.Contains(final, "rejected duplicate auto-extract") {
+		t.Errorf("loop guard didn't fire after %d repeats: %q", fsWriteRepeatCap, final)
+	}
+	if strings.Contains(final, "AUTO-COMMITTED 1 file") {
+		t.Errorf("file was committed despite duplicate guard: %q", final)
+	}
+}
+
 // TestAutoExtractAndCommitWithoutPlanIsSafe verifies that autoExtractAndCommit
 // works (writes files, returns summary) even when st.plan is nil. Pre-fix,
 // the trace emit guard was `st != nil` but blindly indirected through
