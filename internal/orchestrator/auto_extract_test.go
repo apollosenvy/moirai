@@ -178,6 +178,27 @@ func TestExtractFileBlocksRejectsControlChars(t *testing.T) {
 	}
 }
 
+// TestExtractFileBlocksHandlesUTF8BOM closes audit-pass-3 P3-MIN-1: a
+// fence body whose first byte is a UTF-8 BOM (0xEF 0xBB 0xBF) used to
+// silently drop the file because Go's \s in the marker regex doesn't
+// match the BOM. Post-fix the BOM is stripped before regex scanning.
+func TestExtractFileBlocksHandlesUTF8BOM(t *testing.T) {
+	reply := "```typescript\n" +
+		"\ufeff# file: src/bom.ts\n" +
+		"export const x = 1;\n" +
+		"```\n"
+	files := extractFileBlocks(reply)
+	if len(files) != 1 {
+		t.Fatalf("BOM-prefixed body should yield 1 file, got %d: %+v", len(files), files)
+	}
+	if files[0].Path != "src/bom.ts" {
+		t.Errorf("path: %q, want src/bom.ts", files[0].Path)
+	}
+	if !strings.Contains(files[0].Content, "export const x = 1;") {
+		t.Errorf("content lost: %q", files[0].Content)
+	}
+}
+
 // TestExtractFileBlocksRejectsEmbeddedMarkerInStringLiteral: a `# file:`
 // that appears inside a Go raw string, a Markdown body, or any other
 // multi-line literal must NOT be treated as a split boundary. Pre-fix,

@@ -2526,7 +2526,11 @@ func extractFileBlocks(reply string) []codeFileExtraction {
 		if len(m) < 2 {
 			continue
 		}
-		body := m[1]
+		// Strip a leading UTF-8 BOM from the fence body. Go's `\s` does
+		// not match the BOM (0xEF 0xBB 0xBF), so a fence body that
+		// begins with one would yield zero marker matches and the file
+		// would be silently dropped. Closes audit-pass-3 P3-MIN-1.
+		body := strings.TrimPrefix(m[1], "\ufeff")
 		// Find ALL candidate `# file:` markers, then keep only the ones
 		// that look like a true file-boundary line (see fileMarkerIsBoundary).
 		allIdxs := fileMarkerRE.FindAllStringIndex(body, -1)
