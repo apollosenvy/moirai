@@ -1638,11 +1638,17 @@ func (o *Orchestrator) executeROTool(ctx context.Context, st *runState, tb *tool
 			st.lastTestFailed = true
 		} else {
 			st.lastTestFailed = false
-			// Tick acceptance items with verify="test.run:pass".
-			if n := st.plan.MarkAcceptance("test.run:pass"); n > 0 {
+			// Tick acceptance items with verify="test.run:pass". Always
+			// emit the trace event when the plan is loaded and the run
+			// succeeded -- distinguishes "no acceptance with that verify"
+			// (n=0) from "test.run never succeeded". Matches fs.write /
+			// auto_extract / rolling_compact diagnostic shape.
+			if st.plan != nil {
+				n := st.plan.MarkAcceptance("test.run:pass")
 				st.trace.Emit(trace.KindInfo, map[string]any{
 					"checklist_ticked": n,
 					"verify":           "test.run:pass",
+					"source":           "test_run",
 				})
 			}
 		}
@@ -1656,10 +1662,12 @@ func (o *Orchestrator) executeROTool(ctx context.Context, st *runState, tb *tool
 		}
 		st.workOps++
 		if r.ExitCode == 0 {
-			if n := st.plan.MarkAcceptance("compile.run:pass"); n > 0 {
+			if st.plan != nil {
+				n := st.plan.MarkAcceptance("compile.run:pass")
 				st.trace.Emit(trace.KindInfo, map[string]any{
 					"checklist_ticked": n,
 					"verify":           "compile.run:pass",
+					"source":           "compile_run",
 				})
 			}
 		}
