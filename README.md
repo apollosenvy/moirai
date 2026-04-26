@@ -18,6 +18,30 @@ go build -o bin/agent-router ./cmd/agent-router
 Produces a single ~14 MB static binary. No external runtime deps beyond
 `llama-server`, `git`, `rg`, and (optionally) `bwrap`.
 
+### Diagnostic tools (rematch postmortem trio)
+
+Three small CLIs sit beside the daemon for inspecting and comparing
+rematch trace files (`~/.local/share/agent-router/traces/<task-id>.jsonl`):
+
+```bash
+go build -o bin/trace-tail    ./cmd/trace-tail      # live single-line stream
+go build -o bin/trace-summary ./cmd/trace-summary   # post-mortem rollup (one page)
+go build -o bin/trace-diff    ./cmd/trace-diff      # side-by-side comparison
+```
+
+Typical rematch debug session:
+
+```bash
+# In one terminal: watch a running task
+trace-tail ~/.local/share/agent-router/traces/<task-id>.jsonl
+
+# After the task ends: see the rollup
+trace-summary ~/.local/share/agent-router/traces/<task-id>.jsonl
+
+# After a fix landed: confirm the new run made it further
+trace-diff <baseline-task>.jsonl <candidate-task>.jsonl
+```
+
 ## Quickstart
 
 1. Create a config (optional; defaults are sane for Gary's box):
