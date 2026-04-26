@@ -223,27 +223,68 @@ func validAcceptanceVerify(verify string) bool {
 	return false
 }
 
-// lastBalancedObject scans backward for the start of the rightmost balanced
-// JSON object in s. Returns the substring including its enclosing braces, or
-// "" if no balanced object is found.
+// lastBalancedObject scans for the rightmost top-level balanced JSON
+// object in s. Returns the substring including enclosing braces, or ""
+// if no balanced object is found.
+//
+// Unlike a naive backward brace counter, this implementation respects JSON
+// string-literal boundaries so that '{' or '}' characters appearing INSIDE
+// a string value (e.g. an Acceptance description like "use { for opening")
+// are not counted as structural braces. Closes audit-pass-1 ADV-14.
+//
+// Strategy: scan FORWARD through the entire string, tracking depth and
+// in-string state. Whenever depth opens from 0 to 1, mark a candidate
+// start. Whenever depth closes from 1 back to 0, that's a complete top-
+// level object; remember its (start, end). At end-of-input return the
+// LAST recorded (start, end) span. This pairs the OUTERMOST braces of
+// the rightmost top-level object, which matches the "trailing JSON wins"
+// contract callers depend on (planner reasoning models append the real
+// plan at the end of their reply, sometimes after example JSON earlier
+// in the response).
 func lastBalancedObject(s string) string {
-	end := strings.LastIndexByte(s, '}')
-	if end < 0 {
-		return ""
-	}
 	depth := 0
-	for i := end; i >= 0; i-- {
-		switch s[i] {
-		case '}':
-			depth++
+	inString := false
+	curStart := -1
+	bestStart, bestEnd := -1, -1
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if inString {
+			switch c {
+			case '\\':
+				// Skip the escaped char so \" doesn't terminate the
+				// string. \n / \uXXXX / \\ etc. are byte-skipped too;
+				// we don't need full unescape semantics here.
+				i++
+			case '"':
+				inString = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inString = true
 		case '{':
-			depth--
 			if depth == 0 {
-				return s[i : end+1]
+				curStart = i
+			}
+			depth++
+		case '}':
+			depth--
+			if depth == 0 && curStart >= 0 {
+				bestStart, bestEnd = curStart, i
+				curStart = -1
+			}
+			if depth < 0 {
+				// Stray '}' before any '{' -- reset and continue.
+				depth = 0
+				curStart = -1
 			}
 		}
 	}
-	return ""
+	if bestStart < 0 {
+		return ""
+	}
+	return s[bestStart : bestEnd+1]
 }
 
 // MarkFileWritten ticks every FileSpec whose Path equals path (or matches

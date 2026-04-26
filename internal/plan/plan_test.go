@@ -259,6 +259,46 @@ func TestMarkFileSuffixDoesNotShadowExact(t *testing.T) {
 	}
 }
 
+func TestParseUnfencedJSONWithBraceInString(t *testing.T) {
+	// ADV-14: an unfenced trailing JSON whose string values contain
+	// literal '{' or '}' characters used to confuse the naive backward
+	// brace counter (it would treat in-string braces as structural and
+	// return a misaligned slice). Post-fix the scanner respects string
+	// boundaries.
+	reply := `Here's the plan in prose, then JSON: {"phases":[{"id":"P1","name":"x","files":[{"path":"a.ts","purpose":"use { and } in the doc"}]}],"acceptance":[{"id":"A1","description":"verify {} balanced","verify":""}]}`
+	p, err := Parse(reply)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if p == nil {
+		t.Fatal("expected non-nil plan")
+	}
+	if len(p.Phases) != 1 || len(p.Phases[0].Files) != 1 {
+		t.Errorf("phases/files: %+v", p.Phases)
+	}
+	if p.Phases[0].Files[0].Purpose != "use { and } in the doc" {
+		t.Errorf("Purpose lost the literal braces: %q", p.Phases[0].Files[0].Purpose)
+	}
+	if len(p.Acceptance) != 1 || p.Acceptance[0].Description != "verify {} balanced" {
+		t.Errorf("Acceptance description with braces: %+v", p.Acceptance)
+	}
+}
+
+func TestParseUnfencedJSONPicksTrailingNotExample(t *testing.T) {
+	// When prose contains an example JSON THEN a real trailing plan,
+	// the unfenced fallback must pick the trailing one (preserving
+	// "trailing JSON wins" semantics that reasoning-model outputs rely
+	// on).
+	reply := `Example: {"phases":[],"acceptance":[]} Now the real plan: {"phases":[{"id":"P1","name":"real","files":[{"path":"x.ts"}]}],"acceptance":[]}`
+	p, err := Parse(reply)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if p == nil || len(p.Phases) != 1 || p.Phases[0].Name != "real" {
+		t.Errorf("expected the trailing plan, got: %+v", p)
+	}
+}
+
 func TestParseDeduplicatesAcceptanceIDs(t *testing.T) {
 	// ADV-13: a planner emitting two Acceptance items with the same ID
 	// makes the gate ambiguous. Parse must keep the first and drop the
