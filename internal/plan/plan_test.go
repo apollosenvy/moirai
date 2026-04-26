@@ -259,6 +259,39 @@ func TestMarkFileSuffixDoesNotShadowExact(t *testing.T) {
 	}
 }
 
+func TestMarkFileWrittenNormalizesBackslash(t *testing.T) {
+	// ADV-09: a path with backslash separators (e.g. emitted by a model
+	// trained on Windows-style examples) must still match a forward-slash
+	// FileSpec.Path.
+	reply := "```json\n" + `{"phases":[{"id":"P1","name":"x","files":[{"path":"src/foo.go"}]}],"acceptance":[]}` + "\n```"
+	p, _ := Parse(reply)
+	if p == nil {
+		t.Fatal("parse")
+	}
+	if n := p.MarkFileWritten("src\\foo.go"); n != 1 {
+		t.Errorf("backslash path: n=%d, want 1", n)
+	}
+	if !p.Phases[0].Files[0].Satisfied {
+		t.Error("backslash path should have ticked the FileSpec")
+	}
+}
+
+func TestMarkFileWrittenCollapsesDoubleSlash(t *testing.T) {
+	// ADV-10: a path with adjacent slashes (e.g. from a naive base+rel
+	// join that left a trailing "/" on the base) must still match.
+	reply := "```json\n" + `{"phases":[{"id":"P1","name":"x","files":[{"path":"src/foo.go"}]}],"acceptance":[]}` + "\n```"
+	p, _ := Parse(reply)
+	if p == nil {
+		t.Fatal("parse")
+	}
+	if n := p.MarkFileWritten("src//foo.go"); n != 1 {
+		t.Errorf("double-slash path: n=%d, want 1", n)
+	}
+	if !p.Phases[0].Files[0].Satisfied {
+		t.Error("double-slash path should have ticked")
+	}
+}
+
 func TestPathSegmentSuffixRejectsSubstring(t *testing.T) {
 	// "ackage.json" must NOT be considered a suffix of "package.json" -- we
 	// require segment alignment.

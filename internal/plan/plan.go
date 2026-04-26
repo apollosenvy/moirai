@@ -538,11 +538,21 @@ func (p *Plan) renderProgressFooter(b *strings.Builder) {
 	fmt.Fprintf(b, "\nProgress: %d/%d files, %d/%d acceptance.\n", fd, ft, ad, at)
 }
 
-// normalizePath strips "./" prefix and trailing slashes; lowercases path
-// separators. Does NOT resolve to absolute -- that's the orchestrator's
-// job at write time.
+// normalizePath strips "./" prefix, trailing slashes, and normalizes
+// separators (backslash -> forward, runs of slashes collapsed). Does
+// NOT resolve to absolute -- that's the orchestrator's job at write
+// time. Closes audit-pass-1 ADV-09 (backslash separators -- if a model
+// emits Windows-style paths, we still match) and ADV-10 (double slashes
+// from naive base+relative joins still match).
 func normalizePath(p string) string {
 	p = strings.TrimSpace(p)
+	// ADV-09: convert backslash separators to forward.
+	p = strings.ReplaceAll(p, "\\", "/")
+	// ADV-10: collapse runs of forward slashes to a single slash. We do
+	// this by repeated replacement (cheap; paths are short).
+	for strings.Contains(p, "//") {
+		p = strings.ReplaceAll(p, "//", "/")
+	}
 	p = strings.TrimPrefix(p, "./")
 	p = strings.TrimSuffix(p, "/")
 	// We DO NOT lowercase the whole path; case-sensitivity matters on
