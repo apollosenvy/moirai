@@ -2117,6 +2117,38 @@ RULES:
     fenced blocks only.
   - If a path comment is missing the file is discarded. Always include it.
   - Keep implementations tight; no dead code, no speculative abstractions.
+
+NESTED FENCES (markdown / shell heredocs whose body contains backtick
+fences): use a LONGER outer fence so the inner triple-backtick does not
+close the outer. CommonMark accepts 3+ backticks (or 3+ tildes) for a
+fence; the closer must use the same character and be at LEAST as long
+as the opener.
+
+Concrete: a README.md whose body has an inner shell example needs four
+backticks outer:
+
+    ` + "````" + `md
+    # file: README.md
+    # Project
+
+    ## Install
+
+    ` + "```" + `bash
+    npm install
+    ` + "```" + `
+
+    Done.
+    ` + "````" + `
+
+Or use ~~~ tildes for the outer fence -- they do not share characters
+with the inner backtick fence, so no length escalation is needed:
+
+    ~~~md
+    # file: README.md
+    ` + "```" + `bash
+    npm install
+    ` + "```" + `
+    ~~~
 `
 	if retryMode {
 		base += `
@@ -2489,9 +2521,13 @@ func stripToolTags(s string) string {
 	return strings.TrimSpace(s)
 }
 
-// codeFenceRE matches a markdown code fence: opening ``` with optional
-// language tag, then content, then closing ```. The content group is
-// captured. We use a non-greedy match so adjacent fences don't collapse.
+// codeFenceRE is retained for completeness but the live extractor uses
+// findFenceBlocks() (a line-aware walker) for correct handling of nested
+// fences. The non-greedy regex truncates README/markdown bodies at the
+// first inner fence -- audit-pass-1 ADV-04. Replaced with a CommonMark-
+// style fence walker that matches close fence to open fence by length:
+// a 4-backtick outer fence is NOT closed by a 3-backtick inner fence, so
+// a coder emitting markdown content can use ```` outer + ``` inner.
 var codeFenceRE = regexp.MustCompile("(?s)```[a-zA-Z0-9_+\\-]*\\s*\\n?(.*?)```")
 
 // fileMarkerRE matches the `# file: <path>` or `// file: <path>` line
@@ -2528,17 +2564,14 @@ type codeFileExtraction struct {
 // phantom file. Audit pass-2 caught the regression; this revision adds
 // the boundary check so neither failure mode applies.
 func extractFileBlocks(reply string) []codeFileExtraction {
-	matches := codeFenceRE.FindAllStringSubmatch(reply, -1)
-	out := make([]codeFileExtraction, 0, len(matches))
-	for _, m := range matches {
-		if len(m) < 2 {
-			continue
-		}
+	bodies := findFenceBlocks(reply)
+	out := make([]codeFileExtraction, 0, len(bodies))
+	for _, raw := range bodies {
 		// Strip a leading UTF-8 BOM from the fence body. Go's `\s` does
 		// not match the BOM (0xEF 0xBB 0xBF), so a fence body that
 		// begins with one would yield zero marker matches and the file
 		// would be silently dropped. Closes audit-pass-3 P3-MIN-1.
-		body := strings.TrimPrefix(m[1], "\ufeff")
+		body := strings.TrimPrefix(raw, "\ufeff")
 		// Find ALL candidate `# file:` markers, then keep only the ones
 		// that look like a true file-boundary line (see fileMarkerIsBoundary).
 		allIdxs := fileMarkerRE.FindAllStringIndex(body, -1)
@@ -2592,6 +2625,100 @@ func extractFileBlocks(reply string) []codeFileExtraction {
 		}
 	}
 	return out
+}
+
+// findFenceBlocks walks `reply` line-by-line and returns the body of each
+// well-formed markdown code fence, where a fence is "well-formed" by the
+// CommonMark rule: the closing fence must use the SAME fence character
+// (backtick or tilde) and be AT LEAST as long as the opening fence. This
+// gives coders a way to emit markdown / shell-heredoc content (which itself
+// contains ``` lines) by using a longer outer fence. A 4-backtick outer
+// fence treats embedded 3-backtick lines as content, not as closers.
+//
+// Closes audit-pass-1 ADV-04. The previous regex-based extractor was
+// non-greedy and stopped at the first inner fence, silently truncating
+// README.md / docs / shell-heredoc files that contained their own fences.
+//
+// Returns just the body text (between opener and closer lines, exclusive
+// of both). Newlines preserved. Lines INSIDE a fence are not scanned for
+// further fences -- once we open at depth 1, we only look for the matching
+// close.
+func findFenceBlocks(reply string) []string {
+	lines := strings.Split(reply, "\n")
+	var out []string
+	for i := 0; i < len(lines); {
+		ch, n, ok := parseFenceOpener(lines[i])
+		if !ok {
+			i++
+			continue
+		}
+		// Found opener at line i. Scan forward for matching closer.
+		bodyStart := i + 1
+		bodyEnd := -1
+		for j := bodyStart; j < len(lines); j++ {
+			if isMatchingFenceCloser(lines[j], ch, n) {
+				bodyEnd = j
+				break
+			}
+		}
+		if bodyEnd < 0 {
+			// Unclosed fence -- skip the opener line and continue scanning.
+			i++
+			continue
+		}
+		out = append(out, strings.Join(lines[bodyStart:bodyEnd], "\n"))
+		i = bodyEnd + 1
+	}
+	return out
+}
+
+// parseFenceOpener returns (fence-char, count, true) if `line` is a valid
+// markdown fence opener: 3+ consecutive backticks or tildes at the start,
+// optionally followed by an info string (language tag) and trailing
+// whitespace. (false otherwise.)
+func parseFenceOpener(line string) (byte, int, bool) {
+	trimmed := strings.TrimLeft(line, " \t")
+	if len(trimmed) < 3 {
+		return 0, 0, false
+	}
+	ch := trimmed[0]
+	if ch != '`' && ch != '~' {
+		return 0, 0, false
+	}
+	count := 0
+	for count < len(trimmed) && trimmed[count] == ch {
+		count++
+	}
+	if count < 3 {
+		return 0, 0, false
+	}
+	// Rest of the line (after the fence chars) is the info string. Per
+	// CommonMark a backtick opener cannot contain backticks in its info
+	// string, but we are forgiving here -- the marker we care about is
+	// the language tag, and we don't reject malformed openers.
+	return ch, count, true
+}
+
+// isMatchingFenceCloser reports whether `line` is a valid closer for an
+// opener that used `openerChar` repeated `openerCount` times. Per
+// CommonMark the closer must use the same character, be at least as long,
+// and have ONLY whitespace after the fence run.
+func isMatchingFenceCloser(line string, openerChar byte, openerCount int) bool {
+	trimmed := strings.TrimLeft(line, " \t")
+	count := 0
+	for count < len(trimmed) && trimmed[count] == openerChar {
+		count++
+	}
+	if count < openerCount {
+		return false
+	}
+	rest := trimmed[count:]
+	for _, c := range rest {
+		if c != ' ' && c != '\t' && c != '\r' {
+			return false
+		}
+	}
+	return true
 }
 
 // extractFromOpenAIToolCallJSON recognizes the OpenAI-style structured tool

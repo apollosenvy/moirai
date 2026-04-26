@@ -178,6 +178,69 @@ func TestExtractFileBlocksRejectsControlChars(t *testing.T) {
 	}
 }
 
+// TestExtractFileBlocksHandlesNestedFencesViaOuterLength closes audit-
+// pass-1 ADV-04. A coder emitting a Markdown / shell-heredoc file that
+// itself contains ``` blocks would see the file silently truncated by
+// the prior non-greedy regex. With the line-aware fence walker, the
+// coder uses a longer outer fence (e.g. four backticks ```` outer +
+// three-backtick inner) and the full body extracts correctly.
+func TestExtractFileBlocksHandlesNestedFencesViaOuterLength(t *testing.T) {
+	// Outer fence: 4 backticks (`````md). Inner fences: 3 backticks
+	// (which are CONTENT, not closers, because count=3 < openerCount=4).
+	reply := "Here is a README:\n\n" +
+		"````md\n" +
+		"# file: README.md\n" +
+		"# Project Docs\n" +
+		"\n" +
+		"## Usage\n" +
+		"\n" +
+		"```bash\n" +
+		"npm install\n" +
+		"npm run dev\n" +
+		"```\n" +
+		"\n" +
+		"More documentation.\n" +
+		"````\n"
+	files := extractFileBlocks(reply)
+	if len(files) != 1 {
+		t.Fatalf("nested fence: want 1 file, got %d: %+v", len(files), files)
+	}
+	if files[0].Path != "README.md" {
+		t.Errorf("path: %q, want README.md", files[0].Path)
+	}
+	for _, want := range []string{
+		"# Project Docs",
+		"## Usage",
+		"```bash",          // inner fence preserved as content
+		"npm install",
+		"```",              // inner closer preserved
+		"More documentation.",
+	} {
+		if !strings.Contains(files[0].Content, want) {
+			t.Errorf("README content missing %q: %q", want, files[0].Content)
+		}
+	}
+}
+
+// TestExtractFileBlocksTildeFenceWorks: a coder using ~~~ outer fences
+// (alternative CommonMark fence character) should still extract
+// correctly. Tilde fences don't share content with backtick fences, so
+// using ~~~ outer + ``` inner is also a valid escape path for nested
+// markdown.
+func TestExtractFileBlocksTildeFenceWorks(t *testing.T) {
+	reply := "~~~md\n# file: doc.md\n```bash\nnpm install\n```\n~~~\n"
+	files := extractFileBlocks(reply)
+	if len(files) != 1 {
+		t.Fatalf("tilde fence: want 1 file, got %d: %+v", len(files), files)
+	}
+	if files[0].Path != "doc.md" {
+		t.Errorf("path: %q, want doc.md", files[0].Path)
+	}
+	if !strings.Contains(files[0].Content, "npm install") {
+		t.Errorf("inner content lost: %q", files[0].Content)
+	}
+}
+
 // TestExtractFileBlocksHandlesUTF8BOM closes audit-pass-3 P3-MIN-1: a
 // fence body whose first byte is a UTF-8 BOM (0xEF 0xBB 0xBF) used to
 // silently drop the file because Go's \s in the marker regex doesn't
