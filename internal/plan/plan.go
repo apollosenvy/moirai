@@ -109,7 +109,89 @@ func Parse(reply string) (*Plan, error) {
 	if len(p.Phases) == 0 && len(p.Acceptance) == 0 {
 		return nil, fmt.Errorf("plan: parsed JSON has neither phases nor acceptance")
 	}
+	// Strip out FileSpec entries with malformed paths so the rendered
+	// checklist and the matcher only ever see usable values. Same rules
+	// applied to acceptance items with verify="file:..." (the trimmed
+	// path must look like a relative repo path, not absolute, traversal,
+	// empty, or control-char-laden). Closes adversarial findings ADV-01,
+	// ADV-02, ADV-03, ADV-06: an empty/absolute/traversal verify or path
+	// could either bypass the done() gate (if used as verify="file:")
+	// or corrupt the rendered checklist (if rendered with literal \n).
+	for pi := range p.Phases {
+		filtered := p.Phases[pi].Files[:0]
+		for _, f := range p.Phases[pi].Files {
+			if validPlanPath(f.Path) {
+				filtered = append(filtered, f)
+			}
+		}
+		p.Phases[pi].Files = filtered
+	}
+	filteredAcc := p.Acceptance[:0]
+	for _, a := range p.Acceptance {
+		if !validAcceptanceVerify(a.Verify) {
+			continue
+		}
+		filteredAcc = append(filteredAcc, a)
+	}
+	p.Acceptance = filteredAcc
+	// Post-filter sanity: if every file across every phase was rejected
+	// AND no acceptance items survived, the plan has no usable content.
+	// Empty plan would otherwise install a Plan with empty file list,
+	// which renders an empty checklist and lets done() pass without any
+	// verification.
+	totalFiles := 0
+	for _, ph := range p.Phases {
+		totalFiles += len(ph.Files)
+	}
+	if totalFiles == 0 && len(p.Acceptance) == 0 {
+		return nil, fmt.Errorf("plan: every entry was rejected by path/verify validation")
+	}
 	return &p, nil
+}
+
+// validPlanPath returns true if path is a usable repo-relative path:
+// non-empty, not absolute, no '..' segment, no control characters.
+// Paths that fail validation are dropped at Parse time so the matcher
+// and checklist never have to defend against them downstream.
+func validPlanPath(path string) bool {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return false
+	}
+	if strings.HasPrefix(path, "/") {
+		return false
+	}
+	for _, seg := range strings.Split(path, "/") {
+		if seg == ".." {
+			return false
+		}
+	}
+	for _, r := range path {
+		if r < 0x20 {
+			return false
+		}
+	}
+	return true
+}
+
+// validAcceptanceVerify returns true if the verify string is a recognized
+// shape we know how to auto-tick. Empty is allowed (manual claim). Any
+// "file:..." verify must carry a validPlanPath payload so the gate can
+// never be tricked by an absolute or empty target. Unknown prefixes are
+// rejected so a typo (e.g. "test.run:fail") doesn't silently install an
+// acceptance item that never ticks. Closes ADV-01, ADV-02, ADV-12.
+func validAcceptanceVerify(verify string) bool {
+	if verify == "" {
+		return true
+	}
+	if strings.HasPrefix(verify, "file:") {
+		return validPlanPath(strings.TrimPrefix(verify, "file:"))
+	}
+	switch verify {
+	case "test.run:pass", "compile.run:pass":
+		return true
+	}
+	return false
 }
 
 // lastBalancedObject scans backward for the start of the rightmost balanced
@@ -142,6 +224,14 @@ func lastBalancedObject(s string) string {
 // "/abs/repo/src/foo.go" if repoRoot is provided. The orchestrator passes
 // the resolved path it actually wrote, so it's the planner's path that
 // determines the canonical form.
+//
+// Suffix-uniqueness fallback: if no exact match found, we look for FileSpecs
+// where one path is a strict suffix of the other (split on '/'), AND that
+// suffix relationship is uniquely satisfied by exactly one unticked FileSpec.
+// This handles the common drift of planner saying `web/package.json` while
+// the coder writes `apps/web/package.json` (or vice versa). Uniqueness is
+// required because basename-only match would tick `package.json` ambiguously
+// across a workspace with multiple of them.
 func (p *Plan) MarkFileWritten(path string) int {
 	if p == nil {
 		return 0
@@ -174,7 +264,81 @@ func (p *Plan) MarkFileWritten(path string) int {
 			}
 		}
 	}
+	// Fallback: only run suffix-uniqueness if exact match found nothing.
+	// Conservative -- avoids accidentally ticking the wrong FileSpec when
+	// the planner already specified canonical paths and got an exact hit.
+	if n == 0 {
+		n += p.markFileSuffixUnique(norm)
+	}
 	return n
+}
+
+// markFileSuffixUnique scans for an unticked FileSpec whose normalized path
+// is a suffix-of-segments of the written path or vice versa, AND that no
+// OTHER unticked FileSpec satisfies the same relationship. Returns 1 on a
+// unique match, 0 otherwise.
+func (p *Plan) markFileSuffixUnique(writtenNorm string) int {
+	type cand struct {
+		phaseIdx, fileIdx int
+		acceptIdx         int // -1 if Phase, else acceptance index
+	}
+	var cands []cand
+	for pi := range p.Phases {
+		for fi := range p.Phases[pi].Files {
+			f := &p.Phases[pi].Files[fi]
+			if f.Satisfied {
+				continue
+			}
+			pn := normalizePath(f.Path)
+			if pathSegmentSuffix(writtenNorm, pn) || pathSegmentSuffix(pn, writtenNorm) {
+				cands = append(cands, cand{phaseIdx: pi, fileIdx: fi, acceptIdx: -1})
+			}
+		}
+	}
+	for ai := range p.Acceptance {
+		a := &p.Acceptance[ai]
+		if a.Satisfied || !strings.HasPrefix(a.Verify, "file:") {
+			continue
+		}
+		want := normalizePath(strings.TrimPrefix(a.Verify, "file:"))
+		if pathSegmentSuffix(writtenNorm, want) || pathSegmentSuffix(want, writtenNorm) {
+			cands = append(cands, cand{phaseIdx: -1, fileIdx: -1, acceptIdx: ai})
+		}
+	}
+	if len(cands) != 1 {
+		return 0
+	}
+	c := cands[0]
+	if c.acceptIdx >= 0 {
+		p.Acceptance[c.acceptIdx].Satisfied = true
+	} else {
+		p.Phases[c.phaseIdx].Files[c.fileIdx].Satisfied = true
+	}
+	return 1
+}
+
+// pathSegmentSuffix reports whether b is a suffix of a when split on '/'.
+// Both must already be normalized. We require segment alignment (not raw
+// string suffix) to avoid matching "ackage.json" against "package.json".
+// A path is NOT a suffix of itself for this purpose -- exact equality is
+// caller's responsibility (and is handled by exact match before this runs).
+func pathSegmentSuffix(a, b string) bool {
+	if a == "" || b == "" || a == b {
+		return false
+	}
+	aSeg := strings.Split(a, "/")
+	bSeg := strings.Split(b, "/")
+	if len(bSeg) >= len(aSeg) {
+		return false
+	}
+	// Require b to align with the trailing |b| segments of a.
+	off := len(aSeg) - len(bSeg)
+	for i, seg := range bSeg {
+		if aSeg[off+i] != seg {
+			return false
+		}
+	}
+	return true
 }
 
 // MarkAcceptance ticks acceptance items whose Verify field matches verifyKey
@@ -230,13 +394,60 @@ func (p *Plan) UnsatisfiedAcceptance() []string {
 	return out
 }
 
+// ProgressCounts returns (filesDone, filesTotal, accDone, accTotal) for
+// the current Plan state. Used by the orchestrator's trace events so
+// observers can watch tick progression directly without parsing the
+// rendered checklist text (which is byte-neutral on tick because both
+// "[ ]" and "[x]" are 3 bytes).
+func (p *Plan) ProgressCounts() (filesDone, filesTotal, accDone, accTotal int) {
+	if p == nil {
+		return 0, 0, 0, 0
+	}
+	for _, ph := range p.Phases {
+		for _, f := range ph.Files {
+			filesTotal++
+			if f.Satisfied {
+				filesDone++
+			}
+		}
+	}
+	accTotal = len(p.Acceptance)
+	for _, a := range p.Acceptance {
+		if a.Satisfied {
+			accDone++
+		}
+	}
+	return
+}
+
+// renderCompactThreshold is the file count above which RenderChecklist
+// switches to compact mode: drops Purpose comments to save bytes, and
+// collapses fully-satisfied phases to a single summary line. Calibrated
+// from rematch #18: a 100-file plan rendered in full produces a 7320-
+// byte checklist injected every reviewer turn -- after 30 turns that
+// adds ~150KB to context, blowing the 32K reviewer cap. Compact mode
+// drops it to ~3KB initial, shrinking further as phases complete.
+const renderCompactThreshold = 50
+
 // RenderChecklist produces the <CHECKLIST>...</CHECKLIST> block injected
 // before every reviewer turn. Empty plan returns "" so the caller can skip
-// injection.
+// injection. Switches to compact mode when the plan has more than
+// renderCompactThreshold files.
 func (p *Plan) RenderChecklist() string {
 	if p == nil || (len(p.Phases) == 0 && len(p.Acceptance) == 0) {
 		return ""
 	}
+	_, totalFiles, _, _ := p.ProgressCounts()
+	if totalFiles > renderCompactThreshold {
+		return p.renderChecklistCompact()
+	}
+	return p.renderChecklistFull()
+}
+
+// renderChecklistFull is the original full-fidelity rendering: every
+// FileSpec gets a [x]/[ ] line plus Purpose comment if present. Used
+// for plans up to renderCompactThreshold files.
+func (p *Plan) renderChecklistFull() string {
 	var b strings.Builder
 	b.WriteString("<CHECKLIST>\n")
 	if len(p.Phases) > 0 {
@@ -256,39 +467,69 @@ func (p *Plan) RenderChecklist() string {
 			}
 		}
 	}
-	if len(p.Acceptance) > 0 {
-		if len(p.Phases) > 0 {
-			b.WriteString("\n")
-		}
-		b.WriteString("Acceptance criteria (tick = verified):\n")
-		for _, a := range p.Acceptance {
-			mark := "[ ]"
-			if a.Satisfied {
-				mark = "[x]"
-			}
-			fmt.Fprintf(&b, "  %s %s: %s\n", mark, a.ID, a.Description)
-		}
-	}
-	// Quick summary so the reviewer can see progress at a glance.
-	totalFiles, doneFiles := 0, 0
-	for _, ph := range p.Phases {
-		for _, f := range ph.Files {
-			totalFiles++
-			if f.Satisfied {
-				doneFiles++
-			}
-		}
-	}
-	totalAcc, doneAcc := len(p.Acceptance), 0
-	for _, a := range p.Acceptance {
-		if a.Satisfied {
-			doneAcc++
-		}
-	}
-	fmt.Fprintf(&b, "\nProgress: %d/%d files, %d/%d acceptance.\n",
-		doneFiles, totalFiles, doneAcc, totalAcc)
+	p.renderAcceptance(&b)
+	p.renderProgressFooter(&b)
 	b.WriteString("</CHECKLIST>")
 	return b.String()
+}
+
+// renderChecklistCompact drops file Purpose comments and collapses fully-
+// satisfied phases to a one-line summary ("Phase P1 -- Scaffold (9/9) [x]
+// done"). Phases with any unsatisfied file render in full but without
+// Purpose. Acceptance is always rendered in full because it is small (and
+// each item is the meat of the done() gate).
+func (p *Plan) renderChecklistCompact() string {
+	var b strings.Builder
+	b.WriteString("<CHECKLIST>\n")
+	if len(p.Phases) > 0 {
+		b.WriteString("Files to produce (tick = on disk; phase summary lines collapse fully-done phases):\n")
+		for _, ph := range p.Phases {
+			done, total := 0, len(ph.Files)
+			for _, f := range ph.Files {
+				if f.Satisfied {
+					done++
+				}
+			}
+			if done == total && total > 0 {
+				fmt.Fprintf(&b, "  Phase %s -- %s (%d/%d) [x] done\n", ph.ID, ph.Name, done, total)
+				continue
+			}
+			fmt.Fprintf(&b, "  Phase %s -- %s (%d/%d)\n", ph.ID, ph.Name, done, total)
+			for _, f := range ph.Files {
+				mark := "[ ]"
+				if f.Satisfied {
+					mark = "[x]"
+				}
+				fmt.Fprintf(&b, "    %s %s\n", mark, f.Path)
+			}
+		}
+	}
+	p.renderAcceptance(&b)
+	p.renderProgressFooter(&b)
+	b.WriteString("</CHECKLIST>")
+	return b.String()
+}
+
+func (p *Plan) renderAcceptance(b *strings.Builder) {
+	if len(p.Acceptance) == 0 {
+		return
+	}
+	if len(p.Phases) > 0 {
+		b.WriteString("\n")
+	}
+	b.WriteString("Acceptance criteria (tick = verified):\n")
+	for _, a := range p.Acceptance {
+		mark := "[ ]"
+		if a.Satisfied {
+			mark = "[x]"
+		}
+		fmt.Fprintf(b, "  %s %s: %s\n", mark, a.ID, a.Description)
+	}
+}
+
+func (p *Plan) renderProgressFooter(b *strings.Builder) {
+	fd, ft, ad, at := p.ProgressCounts()
+	fmt.Fprintf(b, "\nProgress: %d/%d files, %d/%d acceptance.\n", fd, ft, ad, at)
 }
 
 // normalizePath strips "./" prefix and trailing slashes; lowercases path

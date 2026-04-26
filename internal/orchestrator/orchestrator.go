@@ -132,6 +132,19 @@ const (
 	// a good default: small enough that most useful stubs fit under it,
 	// large enough that we do not compact normal plan/verdict outputs.
 	DefaultCompactThresholdBytes = 4096
+
+	// rollingWindowAskCoder is how many of the most-recent ask_coder result
+	// blocks we keep verbatim in the reviewer's message history. Older
+	// ask_coder results get summarized down to a one-line stub preserving
+	// the AUTO-COMMITTED file list (which is the only piece the reviewer
+	// usually needs from a 5-turn-old coder reply). Calibrated from
+	// rematch #17 (2026-04-26): the reviewer hit the 32K ctx wall at turn
+	// 19 with 17 accumulated ask_coder results -- if we had kept only the
+	// most recent 4 in full and stubbed the rest, the request would have
+	// fit. 4 is small enough to reclaim ~10-25KB across a long task and
+	// large enough to preserve the immediate reasoning trail the reviewer
+	// actually re-reads.
+	rollingWindowAskCoder = 4
 )
 
 // ModelManager is the subset of *modelmgr.Manager the orchestrator needs.
@@ -272,6 +285,19 @@ type runState struct {
 	// injected. Used to suppress duplicate injections turn-over-turn
 	// when nothing has changed.
 	lastChecklistRendered string
+
+	// lastChecklistMsgIdx is the index of the user-role message holding
+	// the most-recently-injected <CHECKLIST> block. Tracked so we can
+	// REPLACE the previous checklist instead of appending a new one --
+	// otherwise every tick produces a new ~4KB user message and the
+	// reviewer's context grows linearly with turn count. -1 means no
+	// checklist has been injected yet (next injection appends and
+	// records the index for future replacement).
+	//
+	// Invariant: when lastChecklistMsgIdx >= 0, messages[idx].Role
+	// MUST be "user" and messages[idx].Content MUST start with
+	// "<CHECKLIST>". The injection site asserts this before mutating.
+	lastChecklistMsgIdx int
 
 	// Flag: has a test.run failed since the last ask_coder? If so, the next
 	// ask_coder should get fs.read + fs.search access.
@@ -447,7 +473,7 @@ func (o *Orchestrator) Submit(ctx context.Context, description, repoRoot string)
 		parentCtx = o.daemonCtx
 	}
 	runCtx, cancel := context.WithCancel(parentCtx)
-	st := &runState{cancel: cancel, task: t, trace: tr}
+	st := &runState{cancel: cancel, task: t, trace: tr, lastChecklistMsgIdx: -1}
 
 	o.mu.Lock()
 	o.running[id] = st
@@ -907,15 +933,46 @@ func (o *Orchestrator) roLoop(ctx context.Context, st *runState, tb *toolbox.Too
 		// Empty when no plan is loaded -- preserves legacy behavior for
 		// reviewers that never get a structured plan.
 		if cl := st.plan.RenderChecklist(); cl != "" && cl != st.lastChecklistRendered {
-			messages = append(messages, modelmgr.ChatMessage{
-				Role:    "user",
-				Content: cl,
-			})
+			// REPLACE the prior checklist message in place when one
+			// exists, otherwise APPEND a new one and record its index.
+			// Replacing prevents context bloat: rematch #21 hit ctx
+			// overflow at turn 9 with 9 cumulative checklist messages
+			// summing to ~30KB. With replacement, exactly one checklist
+			// message lives in messages at any time, regardless of turn
+			// count. Defense-in-depth: assert the recorded index still
+			// points at a checklist (in case of message-array mutation
+			// elsewhere); on mismatch, fall back to append + re-record.
+			replaced := false
+			if st.lastChecklistMsgIdx >= 0 && st.lastChecklistMsgIdx < len(messages) {
+				prior := messages[st.lastChecklistMsgIdx]
+				if prior.Role == "user" && strings.HasPrefix(prior.Content, "<CHECKLIST>") {
+					messages[st.lastChecklistMsgIdx].Content = cl
+					replaced = true
+				}
+			}
+			if !replaced {
+				messages = append(messages, modelmgr.ChatMessage{
+					Role:    "user",
+					Content: cl,
+				})
+				st.lastChecklistMsgIdx = len(messages) - 1
+			}
 			st.lastChecklistRendered = cl
+			// Report tick counts directly. The byte length of cl is a
+			// poor proxy because "[ ]" and "[x]" are both 3 bytes --
+			// flipping a checkbox doesn't change cl's size, so external
+			// observers watching `bytes` can't tell whether the plan is
+			// progressing. files_done / acc_done give the real picture.
+			fd, ft, ad, at := st.plan.ProgressCounts()
 			tr.Emit(trace.KindInfo, map[string]any{
 				"checklist_injected": true,
 				"turn":               st.roTurns,
 				"bytes":              len(cl),
+				"files_done":         fd,
+				"files_total":        ft,
+				"acc_done":           ad,
+				"acc_total":          at,
+				"replaced":           replaced,
 			})
 		}
 
@@ -1117,7 +1174,117 @@ func (o *Orchestrator) roLoop(ctx context.Context, st *runState, tb *toolbox.Too
 			payload = fmt.Sprintf("<RESULT>%s</RESULT>", neutralizeEnvelopeTags(result))
 		}
 		messages = append(messages, modelmgr.ChatMessage{Role: "user", Content: payload})
+
+		// Rolling-window compaction of accumulated ask_coder result
+		// blocks. The most-recent rollingWindowAskCoder are kept verbatim;
+		// older ones are summarized in place. See the constant docstring
+		// for calibration notes from rematch #17. Idempotent on the most
+		// recent results because they are skipped by the "leave the last
+		// N alone" rule.
+		if call.Name == "ask_coder" {
+			// Always emit a rolling_compact trace event after each ask_coder
+			// so observers can confirm the compactor was consulted, even
+			// when reclaimed_bytes=0 (window not yet exceeded). Symmetric
+			// with the auto_extract / fs_write diagnostic philosophy.
+			reclaimed := compactStaleAskCoderResults(messages, rollingWindowAskCoder)
+			tr.Emit(trace.KindInfo, map[string]any{
+				"rolling_compact": true,
+				"reclaimed_bytes": reclaimed,
+				"window":          rollingWindowAskCoder,
+				"turn":            st.roTurns,
+			})
+		}
 	}
+}
+
+// compactStaleAskCoderResults rewrites old ask_coder result messages in
+// the conversation history to a one-line stub preserving the AUTO-COMMITTED
+// file list when present. The most recent `keep` ask_coder result blocks
+// are left verbatim. Returns the total bytes reclaimed. Idempotent: a
+// message that is already shorter than its stub form is left alone.
+//
+// Heuristic identification: an ask_coder result with auto-extracted files
+// is a user-role message whose content starts with the literal prefix
+// "<RESULT>AUTO-COMMITTED " (autoExtractAndCommit prepends "AUTO-COMMITTED N
+// file(s)..." as the leading line of the tool result). We deliberately
+// require a PREFIX match rather than a substring contains: substring
+// matching false-positives on fs.read results that happen to contain
+// "AUTO-COMMITTED" or "# file:" inside their bodies (e.g., the reviewer
+// fs.read'ing PLAN.md or a Markdown file with `# file:` headings would
+// have its content destroyed by the compactor). Caught by audit pass 3
+// (P3-CRIT-1) before it bit a real run.
+//
+// Ask_coder results without an AUTO-COMMITTED block (no files extracted)
+// are NOT compacted: those typically hold reasoning prose the reviewer
+// re-reads, and the compactor's stub would lose that prose. They tend
+// to be small anyway (auto-extract failed because the coder emitted no
+// recognizable fence), so leaving them alone is cheap.
+func compactStaleAskCoderResults(messages []modelmgr.ChatMessage, keep int) int {
+	if keep < 0 {
+		keep = 0
+	}
+	const askCoderPrefix = "<RESULT>AUTO-COMMITTED "
+	// First pass: find indices of ask_coder result messages.
+	var idxs []int
+	for i, m := range messages {
+		if m.Role != "user" {
+			continue
+		}
+		if strings.HasPrefix(m.Content, askCoderPrefix) {
+			idxs = append(idxs, i)
+		}
+	}
+	if len(idxs) <= keep {
+		return 0
+	}
+	// Compact everything except the trailing `keep` indices.
+	stale := idxs[:len(idxs)-keep]
+	reclaimed := 0
+	for _, i := range stale {
+		orig := messages[i].Content
+		stub := stubFromAskCoderResult(orig)
+		if len(stub) >= len(orig) {
+			// Already as small as we can make it; nothing to reclaim.
+			continue
+		}
+		messages[i].Content = stub
+		reclaimed += len(orig) - len(stub)
+	}
+	return reclaimed
+}
+
+// stubFromAskCoderResult condenses an ask_coder <RESULT>...</RESULT> message
+// into a short stub preserving the AUTO-COMMITTED file list when present.
+// Falls back to a plain "(ask_coder result, N bytes, summarized)" stub if
+// no AUTO-COMMITTED summary is found.
+func stubFromAskCoderResult(content string) string {
+	// Already-stubbed messages are idempotent: stubs are short and start
+	// with the marker prefix below.
+	if strings.HasPrefix(content, "<RESULT>[stale ask_coder") {
+		return content
+	}
+	originalLen := len(content)
+	// Pull the leading AUTO-COMMITTED summary block, if present. It looks
+	// like "AUTO-COMMITTED N file(s) from coder reply:\n  - path (bytes, what)\n..."
+	// followed by a blank line and the rest of the prose.
+	body := content
+	body = strings.TrimPrefix(body, "<RESULT>")
+	body = strings.TrimSuffix(body, "</RESULT>")
+	var summary string
+	if strings.HasPrefix(body, "AUTO-COMMITTED ") {
+		// Take through the first blank line (or to end if none).
+		if idx := strings.Index(body, "\n\n"); idx > 0 {
+			summary = body[:idx]
+		} else {
+			summary = body
+		}
+	}
+	if summary != "" {
+		return fmt.Sprintf("<RESULT>[stale ask_coder result, %d bytes summarized]\n%s</RESULT>",
+			originalLen, summary)
+	}
+	return fmt.Sprintf("<RESULT>[stale ask_coder result, %d bytes summarized; no AUTO-COMMITTED block to preserve]</RESULT>",
+		originalLen)
 }
 
 // neutralizeEnvelopeTags replaces tag-like substrings inside model-controlled
@@ -1402,11 +1569,17 @@ func (o *Orchestrator) executeROTool(ctx context.Context, st *runState, tb *tool
 		st.consecutiveFsWrites++
 		// Tick the file off the structured plan (if loaded) and any
 		// "verify: file:<path>" acceptance items. No-op when st.plan
-		// is nil.
-		if n := st.plan.MarkFileWritten(path); n > 0 {
+		// is nil. Always emit the trace event (even on n=0) so we can
+		// distinguish "matcher saw the path but plan paths don't align"
+		// from "fs.write didn't run at all". Matches the auto-extract
+		// path's diagnostic shape.
+		if st.plan != nil {
+			n := st.plan.MarkFileWritten(path)
 			st.trace.Emit(trace.KindInfo, map[string]any{
 				"checklist_ticked": n,
 				"path":             path,
+				"resolved":         res.Path,
+				"source":           "fs_write",
 			})
 		}
 		// The result string is what the RO reads as the tool return. Historical
@@ -1804,6 +1977,26 @@ Rules:
     This is optional; the plan text in your reply itself is what matters.
   - You have NO other tools. Do not attempt fs.read, fs.search, test.run,
     shell.exec, or anything else. Only fs.write to PLAN.md is allowed.
+
+PATH DISCIPLINE (CRITICAL):
+  - Pick ONE canonical layout up front (e.g. "apps/web/..." OR "frontend/..."
+    OR "client/..." -- choose, do not mix). The Coder will write files at
+    EXACTLY the paths you list; if your JSON paths don't match the paths
+    the Coder produces, the live checklist cannot tick them off and the
+    Reviewer cannot tell what is done.
+  - For monorepo projects, default to "apps/<name>/" for runnable apps
+    and "packages/<name>/" for shared libraries unless the task says
+    otherwise. State your layout choice explicitly in step 1 of the
+    prose plan so the Coder follows it.
+  - List files in dependency order: root config (package.json, tsconfig)
+    BEFORE app entry points BEFORE leaf modules. The Coder builds top-down.
+
+PHASE GRANULARITY:
+  - Each phase produces something testable on its own (a passing build,
+    a callable endpoint, a runnable script). The Reviewer should be able
+    to verify a phase before moving on.
+  - 5 to 12 files per phase is a healthy size. Bigger phases tend to
+    starve the Coder's context window; smaller phases burn turns.
 
 STRUCTURED OUTPUT (REQUIRED at end of reply):
 
@@ -2270,9 +2463,24 @@ type codeFileExtraction struct {
 }
 
 // extractFileBlocks walks a coder reply and returns every (path, content)
-// pair where the fence content begins with a `# file: <path>` marker.
+// pair where a fence body contains one or more `# file: <path>` markers.
 // Files without the marker are skipped (the coder might emit examples or
 // snippets the reviewer should read but not commit).
+//
+// Multi-marker fences: a single fence containing multiple `# file:`
+// markers is split into one extraction per marker, BUT only when the
+// marker line stands alone as a structural file-boundary -- i.e. it is
+// either the first non-blank line of the fence body, OR it is preceded
+// by a blank line. This guard avoids false positives where a `# file:`
+// substring appears inside a Go raw string, a Markdown body, a heredoc,
+// or any other multi-line string literal whose content contains the
+// marker pattern but should NOT split the surrounding file.
+//
+// Pre-fix (single-marker, non-greedy regex): an embedded `# file:` inside
+// content silently truncated the file at the embedded marker. Post-multi-
+// marker (no boundary check): the embedded marker actively spawned a
+// phantom file. Audit pass-2 caught the regression; this revision adds
+// the boundary check so neither failure mode applies.
 func extractFileBlocks(reply string) []codeFileExtraction {
 	matches := codeFenceRE.FindAllStringSubmatch(reply, -1)
 	out := make([]codeFileExtraction, 0, len(matches))
@@ -2281,38 +2489,139 @@ func extractFileBlocks(reply string) []codeFileExtraction {
 			continue
 		}
 		body := m[1]
-		marker := fileMarkerRE.FindStringSubmatch(body)
-		if marker == nil {
+		// Find ALL candidate `# file:` markers, then keep only the ones
+		// that look like a true file-boundary line (see fileMarkerIsBoundary).
+		allIdxs := fileMarkerRE.FindAllStringIndex(body, -1)
+		allSubs := fileMarkerRE.FindAllStringSubmatch(body, -1)
+		var markerIdxs [][]int
+		var markerSubs [][]string
+		for j, idx := range allIdxs {
+			if fileMarkerIsBoundary(body, idx[0]) {
+				markerIdxs = append(markerIdxs, idx)
+				markerSubs = append(markerSubs, allSubs[j])
+			}
+		}
+		if len(markerIdxs) == 0 {
 			continue
 		}
-		// Strip the file-marker line from the body so the file written
-		// to disk is just the code.
-		path := strings.TrimSpace(marker[1])
-		if path == "" {
-			continue
+		for j, idx := range markerIdxs {
+			path := strings.TrimSpace(markerSubs[j][1])
+			if !validExtractionPath(path) {
+				continue
+			}
+			// Content starts after the marker line, ends at the next
+			// boundary marker (if any) or the end of body.
+			contentStart := idx[1]
+			contentEnd := len(body)
+			if j+1 < len(markerIdxs) {
+				contentEnd = markerIdxs[j+1][0]
+			}
+			bodyOut := strings.TrimPrefix(body[contentStart:contentEnd], "\n")
+			// Trim trailing whitespace on the segment so each extracted
+			// file ends cleanly without bleeding into the next marker's
+			// leading blank lines (and so the last marker's content
+			// doesn't carry the closing fence's trailing whitespace).
+			bodyOut = strings.TrimRight(bodyOut, " \t\r\n")
+			out = append(out, codeFileExtraction{
+				Path:    path,
+				Content: bodyOut + "\n", // ensure single trailing newline
+			})
 		}
-		// Reject anything that looks suspicious as a path: absolute
-		// paths and parent-directory traversal are rejected at the
-		// toolbox layer too, but failing fast here means the reviewer
-		// sees a clear "skipped" entry instead of an error.
-		if strings.HasPrefix(path, "/") || strings.Contains(path, "..") {
-			continue
-		}
-		// Cut everything from the start of the body up to and including
-		// the marker line's trailing newline.
-		bodyOut := body
-		if idx := fileMarkerRE.FindStringIndex(body); idx != nil {
-			bodyOut = body[idx[1]:]
-			// Drop one leading newline if present so the file content
-			// doesn't start with a blank line.
-			bodyOut = strings.TrimPrefix(bodyOut, "\n")
-		}
-		out = append(out, codeFileExtraction{
-			Path:    path,
-			Content: bodyOut,
-		})
 	}
 	return out
+}
+
+// fileMarkerIsBoundary reports whether the marker at byte position `pos`
+// in `body` is in a position that legitimately starts a new file segment.
+//
+// The fileMarkerRE regex begins with `^\s*` in (?m) mode, which means
+// the match position can include leading whitespace that spans the
+// preceding `\n`. We first walk pos forward past any whitespace to find
+// the actual `#` or `/` character; then we look at the line containing
+// that character.
+//
+// Boundary rules:
+//   - First marker (at start of body, ignoring leading whitespace): always
+//     a boundary.
+//   - Subsequent marker: previous non-whitespace line either does not
+//     exist (blank-line separated from the body start) OR consists only
+//     of whitespace (blank line separator).
+//
+// Otherwise the marker is considered embedded in surrounding content
+// (string literal, heredoc body, etc.) and is NOT a split point.
+func fileMarkerIsBoundary(body string, pos int) bool {
+	// 1. Skip leading whitespace from pos to find the actual '#' or '/'
+	//    character that starts the marker proper.
+	hashPos := pos
+	for hashPos < len(body) {
+		c := body[hashPos]
+		if c == ' ' || c == '\t' || c == '\r' || c == '\n' {
+			hashPos++
+			continue
+		}
+		break
+	}
+	// 2. Walk back from hashPos to find the start of the line containing it.
+	lineStart := hashPos
+	for lineStart > 0 && body[lineStart-1] != '\n' {
+		lineStart--
+	}
+	// 3. If lineStart is at body start (or only whitespace before it):
+	//    boundary.
+	if lineStart == 0 {
+		return true
+	}
+	// 4. Look at the previous line. The char at lineStart-1 is the
+	//    newline ending the previous line.
+	prevEnd := lineStart - 1
+	prevStart := prevEnd
+	for prevStart > 0 && body[prevStart-1] != '\n' {
+		prevStart--
+	}
+	prevLine := body[prevStart:prevEnd]
+	// Strip a trailing \r if present (Windows line endings).
+	prevLine = strings.TrimRight(prevLine, "\r")
+	for _, c := range prevLine {
+		if c != ' ' && c != '\t' {
+			return false
+		}
+	}
+	return true
+}
+
+// validExtractionPath enforces the path-shape constraints the auto-extract
+// loop relies on. Centralized so the same checks apply uniformly across
+// every marker we find in a fence (including multi-marker splits).
+//
+// Reject:
+//   - empty path
+//   - absolute path (HasPrefix "/")
+//   - any segment equal to ".." (true traversal; "..." or "a..b" are fine)
+//   - control characters (rune < 0x20 except tab — tabs in paths are
+//     suspicious anyway, but the path-segment constraint already catches
+//     them downstream)
+//
+// The toolbox FSWrite enforces the same rules, but failing fast here gives
+// the reviewer a clear "extraction skipped" signal rather than a generic
+// FSWrite error per file.
+func validExtractionPath(path string) bool {
+	if path == "" {
+		return false
+	}
+	if strings.HasPrefix(path, "/") {
+		return false
+	}
+	for _, seg := range strings.Split(path, "/") {
+		if seg == ".." {
+			return false
+		}
+	}
+	for _, r := range path {
+		if r < 0x20 {
+			return false
+		}
+	}
+	return true
 }
 
 // autoExtractAndCommit parses `# file:`-marked code blocks from the
@@ -2353,9 +2662,21 @@ func autoExtractAndCommit(tb *toolbox.Toolbox, reply string, st *runState) strin
 			what = "overwritten"
 		}
 		committed = append(committed, fmt.Sprintf("%s (%d bytes, %s)", res.Path, res.Bytes, what))
-		// Tick the file off the structured plan (if loaded).
-		if st != nil {
-			_ = st.plan.MarkFileWritten(f.Path)
+		// Tick the file off the structured plan (if loaded). Emit a
+		// trace event regardless of whether anything ticked, so we can
+		// distinguish "auto-extract is calling but plan path doesn't
+		// match" (n=0) from "auto-extract isn't running at all" (no
+		// event at all). Use the resolved path res.Path -- f.Path may
+		// be a planner-style relative path, FSWrite returns the form
+		// the planner specified.
+		if st != nil && st.plan != nil {
+			n := st.plan.MarkFileWritten(f.Path)
+			st.trace.Emit(trace.KindInfo, map[string]any{
+				"checklist_ticked": n,
+				"path":             f.Path,
+				"resolved":         res.Path,
+				"source":           "auto_extract",
+			})
 		}
 	}
 	var b strings.Builder
