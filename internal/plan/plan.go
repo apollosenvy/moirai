@@ -490,7 +490,13 @@ func (p *Plan) renderChecklistCompact() string {
 					done++
 				}
 			}
-			if done == total && total > 0 {
+			// Skip phases with zero files entirely in compact mode --
+			// they add no meaningful information ("Phase Pn -- name (0/0)"
+			// is just clutter). Closes audit-pass-3 P3-MIN-3.
+			if total == 0 {
+				continue
+			}
+			if done == total {
 				fmt.Fprintf(&b, "  Phase %s -- %s (%d/%d) [x] done\n", ph.ID, ph.Name, done, total)
 				continue
 			}

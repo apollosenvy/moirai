@@ -33,7 +33,11 @@ func TestDoneGateRefusesUnsatisfiedAcceptance(t *testing.T) {
 			`OK actually done. <TOOL>{"name":"done","args":{"summary":"surrender"}}</TOOL>`,
 		},
 	}
-	o, err := New(Config{Store: store, ModelMgr: stub})
+	// Bound MaxROTurns so the test exits cleanly after 2 stub responses
+	// rather than burning the default 40 iterations after the gate
+	// rejects done(). Closes audit-pass-3 P3-MIN-4. Test intent
+	// (gate rejects, returns structured error to model) is unchanged.
+	o, err := New(Config{Store: store, ModelMgr: stub, MaxROTurns: 2})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
