@@ -259,6 +259,44 @@ func TestMarkFileSuffixDoesNotShadowExact(t *testing.T) {
 	}
 }
 
+func TestParseDeduplicatesAcceptanceIDs(t *testing.T) {
+	// ADV-13: a planner emitting two Acceptance items with the same ID
+	// makes the gate ambiguous. Parse must keep the first and drop the
+	// rest.
+	reply := "```json\n" + `{"phases":[],"acceptance":[
+		{"id":"A1","description":"first","verify":""},
+		{"id":"A1","description":"duplicate","verify":""},
+		{"id":"A2","description":"unique","verify":""}
+	]}` + "\n```"
+	p, _ := Parse(reply)
+	if p == nil {
+		t.Fatal("parse")
+	}
+	if len(p.Acceptance) != 2 {
+		t.Errorf("dup IDs should yield 2 items, got %d: %+v", len(p.Acceptance), p.Acceptance)
+	}
+	if p.Acceptance[0].Description != "first" {
+		t.Errorf("first occurrence should win: %+v", p.Acceptance)
+	}
+}
+
+func TestParseDeduplicatesFileSpecsWithinPhase(t *testing.T) {
+	// ADV-13 (file variant): within a single phase, duplicate FileSpec
+	// paths are dropped.
+	reply := "```json\n" + `{"phases":[{"id":"P1","name":"x","files":[
+		{"path":"src/a.go"},
+		{"path":"./src/a.go"},
+		{"path":"src/b.go"}
+	]}],"acceptance":[]}` + "\n```"
+	p, _ := Parse(reply)
+	if p == nil {
+		t.Fatal("parse")
+	}
+	if len(p.Phases[0].Files) != 2 {
+		t.Errorf("dup paths within phase should yield 2 files, got %d: %+v", len(p.Phases[0].Files), p.Phases[0].Files)
+	}
+}
+
 func TestMarkFileWrittenNormalizesBackslash(t *testing.T) {
 	// ADV-09: a path with backslash separators (e.g. emitted by a model
 	// trained on Windows-style examples) must still match a forward-slash

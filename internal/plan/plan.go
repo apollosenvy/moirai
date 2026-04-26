@@ -126,14 +126,43 @@ func Parse(reply string) (*Plan, error) {
 		}
 		p.Phases[pi].Files = filtered
 	}
+	// Drop duplicate Acceptance IDs at Parse time. A planner emitting two
+	// items with the same ID makes MarkAcceptanceByID ambiguous (which
+	// one to tick?) and the rendered checklist confusing. Closes audit-
+	// pass-1 ADV-13. We keep the FIRST occurrence and drop subsequent
+	// duplicates -- the planner's first listing is presumed canonical.
+	seenAccID := make(map[string]bool, len(p.Acceptance))
 	filteredAcc := p.Acceptance[:0]
 	for _, a := range p.Acceptance {
 		if !validAcceptanceVerify(a.Verify) {
 			continue
 		}
+		if a.ID != "" && seenAccID[a.ID] {
+			continue
+		}
+		if a.ID != "" {
+			seenAccID[a.ID] = true
+		}
 		filteredAcc = append(filteredAcc, a)
 	}
 	p.Acceptance = filteredAcc
+	// Drop duplicate FileSpec.Path entries within the same phase. Across
+	// phases we tolerate duplicates because phases are display-only and
+	// a model legitimately listing the same shared types file in two
+	// phases is fine. Within a phase, duplicates are typo bugs.
+	for pi := range p.Phases {
+		seenPath := make(map[string]bool, len(p.Phases[pi].Files))
+		dedup := p.Phases[pi].Files[:0]
+		for _, f := range p.Phases[pi].Files {
+			n := normalizePath(f.Path)
+			if seenPath[n] {
+				continue
+			}
+			seenPath[n] = true
+			dedup = append(dedup, f)
+		}
+		p.Phases[pi].Files = dedup
+	}
 	// Post-filter sanity: if every file across every phase was rejected
 	// AND no acceptance items survived, the plan has no usable content.
 	// Empty plan would otherwise install a Plan with empty file list,
