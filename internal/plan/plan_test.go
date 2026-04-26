@@ -370,6 +370,61 @@ func TestMarkFileWrittenCollapsesDoubleSlash(t *testing.T) {
 	}
 }
 
+// TestMarkFileSuffixUniqueAcceptanceBranch closes COV-MIN-10: the
+// suffix-unique fallback for FileSpec entries was tested but the
+// equivalent branch for Acceptance items (verify="file:...") was not.
+// A regression in markFileSuffixUnique's acceptance-item loop would
+// have escaped CI.
+func TestMarkFileSuffixUniqueAcceptanceBranch(t *testing.T) {
+	// Plan has ONLY one acceptance item with verify="file:web/package.json"
+	// (no FileSpecs). Coder writes "apps/web/package.json" -- the suffix
+	// fallback should tick the acceptance via the verify path.
+	reply := "```json\n" + `{"phases":[],"acceptance":[
+		{"id":"A1","description":"shared workspace","verify":"file:web/package.json"}
+	]}` + "\n```"
+	p, _ := Parse(reply)
+	if p == nil {
+		t.Fatal("parse")
+	}
+	n := p.MarkFileWritten("apps/web/package.json")
+	if n != 1 {
+		t.Errorf("suffix-unique acceptance: n=%d, want 1", n)
+	}
+	if !p.Acceptance[0].Satisfied {
+		t.Error("acceptance with file: verify should tick via suffix-unique")
+	}
+}
+
+// TestMarkAcceptanceByID closes COV-IMP-4: the exported function had 0%
+// coverage. Pin its contract: tick by ID, idempotent, return false on
+// unknown ID, no-panic on nil receiver.
+func TestMarkAcceptanceByID(t *testing.T) {
+	p, _ := Parse(samplePlannerReply)
+	if p == nil {
+		t.Fatal("parse")
+	}
+	// Sample plan has acceptance A1, A2, A3.
+	if !p.MarkAcceptanceByID("A2") {
+		t.Error("MarkAcceptanceByID(A2): expected true")
+	}
+	if !p.Acceptance[1].Satisfied {
+		t.Error("A2 should be satisfied")
+	}
+	// Idempotent: already-satisfied returns false.
+	if p.MarkAcceptanceByID("A2") {
+		t.Error("re-tick of A2 should return false")
+	}
+	// Unknown ID returns false.
+	if p.MarkAcceptanceByID("ZZZ") {
+		t.Error("unknown ID should return false")
+	}
+	// Nil receiver returns false (no panic).
+	var nilP *Plan
+	if nilP.MarkAcceptanceByID("A1") {
+		t.Error("nil receiver should return false")
+	}
+}
+
 func TestPathSegmentSuffixRejectsSubstring(t *testing.T) {
 	// "ackage.json" must NOT be considered a suffix of "package.json" -- we
 	// require segment alignment.
