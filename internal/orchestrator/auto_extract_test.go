@@ -256,6 +256,100 @@ func TestExtractFileBlocksAcceptsAdjacentMarkers(t *testing.T) {
 	}
 }
 
+// TestExtractFileBlocksFromOpenAIToolCallJSON: the Qwen3-Coder-30B
+// observed in rematch #22 emits structured tool-call JSON instead of
+// `# file:` markers. extractFileBlocks recognizes the wrapped form
+// `{"name":"fs.write","arguments":{...}}` AND the bare-args form
+// `{"path":"...","content":"..."}` as a single file extraction.
+func TestExtractFileBlocksFromOpenAIToolCallJSON(t *testing.T) {
+	cases := []struct {
+		name         string
+		fenceBody    string
+		wantPath     string
+		wantContains string
+		wantOK       bool
+	}{
+		{
+			name: "wrapped name+arguments",
+			fenceBody: "{\n  \"name\": \"fs.write\",\n  \"arguments\": {\n    \"path\": \"src/foo.ts\",\n    \"content\": \"export const foo = 1;\"\n  }\n}",
+			wantPath:     "src/foo.ts",
+			wantContains: "export const foo = 1;",
+			wantOK:       true,
+		},
+		{
+			name: "wrapped args (alternate spelling)",
+			fenceBody: "{\n  \"name\": \"fs.write\",\n  \"args\": {\n    \"path\": \"src/bar.ts\",\n    \"content\": \"const bar=2;\"\n  }\n}",
+			wantPath:     "src/bar.ts",
+			wantContains: "const bar=2;",
+			wantOK:       true,
+		},
+		{
+			name:         "bare args",
+			fenceBody:    "{\"path\":\"src/baz.ts\",\"content\":\"x\"}",
+			wantPath:     "src/baz.ts",
+			wantContains: "x",
+			wantOK:       true,
+		},
+		{
+			name:      "wrong tool name",
+			fenceBody: "{\"name\":\"test.run\",\"arguments\":{\"path\":\"src/x.ts\",\"content\":\"y\"}}",
+			wantOK:    false,
+		},
+		{
+			name:      "absolute path rejected",
+			fenceBody: "{\"name\":\"fs.write\",\"arguments\":{\"path\":\"/etc/passwd\",\"content\":\"oops\"}}",
+			wantOK:    false,
+		},
+		{
+			name:      "missing content",
+			fenceBody: "{\"name\":\"fs.write\",\"arguments\":{\"path\":\"src/x.ts\"}}",
+			wantOK:    false,
+		},
+		{
+			name:      "non-json fence body",
+			fenceBody: "this is not json",
+			wantOK:    false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := extractFromOpenAIToolCallJSON(tc.fenceBody)
+			if ok != tc.wantOK {
+				t.Errorf("ok=%v, want %v", ok, tc.wantOK)
+				return
+			}
+			if !ok {
+				return
+			}
+			if got.Path != tc.wantPath {
+				t.Errorf("path=%q, want %q", got.Path, tc.wantPath)
+			}
+			if !strings.Contains(got.Content, tc.wantContains) {
+				t.Errorf("content missing %q: %q", tc.wantContains, got.Content)
+			}
+		})
+	}
+}
+
+// TestExtractFileBlocksFallsBackToOpenAIJSON: when a fence has NO
+// `# file:` marker but DOES contain a recognizable OpenAI-style
+// fs.write JSON, the extractor returns the JSON-derived file.
+func TestExtractFileBlocksFallsBackToOpenAIJSON(t *testing.T) {
+	reply := "Here is the file:\n\n```json\n" +
+		"{\n  \"name\": \"fs.write\",\n  \"arguments\": {\n    \"path\": \"package.json\",\n    \"content\": \"{\\n  \\\"name\\\": \\\"app\\\"\\n}\"\n  }\n}\n" +
+		"```\n"
+	files := extractFileBlocks(reply)
+	if len(files) != 1 {
+		t.Fatalf("want 1 file, got %d: %+v", len(files), files)
+	}
+	if files[0].Path != "package.json" {
+		t.Errorf("path=%q, want package.json", files[0].Path)
+	}
+	if !strings.Contains(files[0].Content, `"name"`) || !strings.Contains(files[0].Content, `"app"`) {
+		t.Errorf("content lost JSON detail: %q", files[0].Content)
+	}
+}
+
 // TestValidExtractionPathRejectsTraversalSegmentOnly: a path containing
 // '..' as a directory NAME (segment) must be rejected, but a path
 // containing '..' as a substring of a directory name (e.g. 'a..b') is

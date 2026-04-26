@@ -2502,6 +2502,19 @@ func extractFileBlocks(reply string) []codeFileExtraction {
 			}
 		}
 		if len(markerIdxs) == 0 {
+			// Fallback: try to parse the fence body as an OpenAI-style
+			// fs.write tool call. Qwen3-Coder-30B-A3B-Instruct (rematch
+			// #22) emits structured JSON of the shape:
+			//   {"name":"fs.write","arguments":{"path":"...","content":"..."}}
+			// instead of the markdown `# file:` marker convention. We
+			// recognize this pattern and return it as a single file
+			// extraction so the rest of the auto-extract path doesn't
+			// need to know about model dialects. Multiple JSON tool
+			// calls in one fence are NOT supported -- the model would
+			// have to use multi-fence output (which we already handle).
+			if extracted, ok := extractFromOpenAIToolCallJSON(body); ok {
+				out = append(out, extracted)
+			}
 			continue
 		}
 		for j, idx := range markerIdxs {
@@ -2529,6 +2542,89 @@ func extractFileBlocks(reply string) []codeFileExtraction {
 		}
 	}
 	return out
+}
+
+// extractFromOpenAIToolCallJSON recognizes the OpenAI-style structured tool
+// call format that some coder models (Qwen3-Coder-30B observed in rematch
+// #22) emit instead of the documented `# file:` marker convention. It
+// accepts both shapes:
+//
+//	{"name":"fs.write","arguments":{"path":"...","content":"..."}}
+//	{"path":"...","content":"..."}                              // bare args
+//
+// Plus a couple of common variants: "args" instead of "arguments", and
+// nested "function" key (older OpenAI tool-call dialect). Returns the
+// extracted (path, content) and true on success; false otherwise.
+//
+// Path validation is the same as marker-extracted files: absolute paths
+// and traversal segments are rejected; the returned path is the planner-
+// canonical form (relative-to-repo) the toolbox.FSWrite expects.
+func extractFromOpenAIToolCallJSON(body string) (codeFileExtraction, bool) {
+	body = strings.TrimSpace(body)
+	if !strings.HasPrefix(body, "{") {
+		return codeFileExtraction{}, false
+	}
+	type argShape struct {
+		Path    string `json:"path"`
+		Content string `json:"content"`
+	}
+	type wrapShape struct {
+		Name      string    `json:"name"`
+		Arguments argShape  `json:"arguments,omitempty"`
+		Args      argShape  `json:"args,omitempty"`
+		Function  *wrapShape `json:"function,omitempty"`
+		// Bare-args fields (when the JSON is JUST args, not wrapped).
+		Path    string `json:"path,omitempty"`
+		Content string `json:"content,omitempty"`
+	}
+	var w wrapShape
+	if err := json.Unmarshal([]byte(body), &w); err != nil {
+		return codeFileExtraction{}, false
+	}
+	// Drill into nested shapes.
+	for w.Function != nil {
+		w = *w.Function
+	}
+	// Pull args from whichever variant the model used.
+	var path, content string
+	switch {
+	case w.Arguments.Path != "" || w.Arguments.Content != "":
+		path, content = w.Arguments.Path, w.Arguments.Content
+	case w.Args.Path != "" || w.Args.Content != "":
+		path, content = w.Args.Path, w.Args.Content
+	case w.Path != "" || w.Content != "":
+		path, content = w.Path, w.Content
+	default:
+		return codeFileExtraction{}, false
+	}
+	// Only honor fs.write-style extractions. If `name` is set and is NOT
+	// fs.write, treat as not-a-file. (When name is empty -- the bare-args
+	// shape -- we accept by default since the path/content presence is
+	// itself the signal.)
+	if w.Name != "" && w.Name != "fs.write" {
+		return codeFileExtraction{}, false
+	}
+	// Strip an absolute-path prefix that some models emit (e.g.
+	// /home/aegis/Projects/traceforge-ar/apps/server/package.json). The
+	// toolbox would resolve absolutes to the same place, but
+	// validExtractionPath rejects HasPrefix("/"), so we'd lose otherwise
+	// valid extractions. Heuristic: if path is absolute and contains
+	// "/Projects/" with a trailing repo-shaped segment, take everything
+	// after the first repo segment. More conservative: simply reject and
+	// let the model retry. We pick conservative for now (consistent with
+	// the auditor's path-discipline philosophy); the planner prompt
+	// already pushes models toward relative paths.
+	if !validExtractionPath(path) {
+		return codeFileExtraction{}, false
+	}
+	if content == "" {
+		return codeFileExtraction{}, false
+	}
+	// Ensure single trailing newline (consistent with marker extraction).
+	if !strings.HasSuffix(content, "\n") {
+		content += "\n"
+	}
+	return codeFileExtraction{Path: path, Content: content}, true
 }
 
 // fileMarkerIsBoundary reports whether the marker at byte position `pos`
