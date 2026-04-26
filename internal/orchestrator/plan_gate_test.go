@@ -3,6 +3,8 @@ package orchestrator
 import (
 	"context"
 	"fmt"
+	"io"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -243,6 +245,77 @@ func TestChecklistInjectionReplacesNotAppends(t *testing.T) {
 	}
 	if checklistCount != 1 {
 		t.Errorf("final messages should have exactly 1 <CHECKLIST>, got %d (replacement broken)", checklistCount)
+	}
+}
+
+// TestInstallPlanFromReply closes audit-pass-1 COV-IMP-7: the planner-
+// reply -> plan.Parse -> st.plan handoff was untested end-to-end. The
+// helper has three branches: valid JSON installs the plan, malformed
+// JSON emits plan_parse_error and leaves plan nil, no-JSON reply is a
+// silent legacy path with plan still nil and no trace event.
+func TestInstallPlanFromReply(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	cases := []struct {
+		name        string
+		reply       string
+		wantPlan    bool
+		wantTraceK  string // expected key in any emitted info event, empty = no event
+	}{
+		{
+			name: "valid JSON installs plan",
+			reply: "Here is the plan.\n\n```json\n" +
+				`{"phases":[{"id":"P1","name":"x","files":[{"path":"a.go"}]}],"acceptance":[]}` +
+				"\n```",
+			wantPlan:   true,
+			wantTraceK: "plan_parsed",
+		},
+		{
+			name:       "malformed JSON emits plan_parse_error",
+			reply:      "Here's the plan: ```json\n{phases: not-quoted}\n```",
+			wantPlan:   false,
+			wantTraceK: "plan_parse_error",
+		},
+		{
+			name:       "no JSON at all is silent legacy path",
+			reply:      "Just prose, no structured plan.",
+			wantPlan:   false,
+			wantTraceK: "", // no trace event expected
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tw, err := trace.Open("test-install-plan-" + tc.name)
+			if err != nil {
+				t.Fatalf("trace.Open: %v", err)
+			}
+			defer tw.Close()
+			st := &runState{trace: tw}
+			installPlanFromReply(st, tc.reply)
+
+			if tc.wantPlan && st.plan == nil {
+				t.Error("expected plan installed, got nil")
+			}
+			if !tc.wantPlan && st.plan != nil {
+				t.Errorf("expected nil plan, got %+v", st.plan)
+			}
+			// Read trace file back to assert event presence.
+			tw.Close()
+			f, err := os.Open(tw.Path())
+			if err != nil {
+				t.Fatalf("open trace: %v", err)
+			}
+			defer f.Close()
+			data, _ := io.ReadAll(f)
+			s := string(data)
+			if tc.wantTraceK == "" {
+				if strings.Contains(s, "plan_parsed") || strings.Contains(s, "plan_parse_error") {
+					t.Errorf("expected no plan_* trace event, got: %s", s)
+				}
+			} else if !strings.Contains(s, tc.wantTraceK) {
+				t.Errorf("expected trace key %q in trace, got: %s", tc.wantTraceK, s)
+			}
+		})
 	}
 }
 

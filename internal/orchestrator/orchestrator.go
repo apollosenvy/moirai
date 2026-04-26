@@ -1287,6 +1287,37 @@ func stubFromAskCoderResult(content string) string {
 		originalLen)
 }
 
+// installPlanFromReply parses a planner reply for the trailing structured
+// JSON plan and, if present and valid, installs it on st.plan. Emits one
+// of two trace events:
+//   - plan_parsed=true with phase/acceptance counts on success
+//   - plan_parse_error=<err> on malformed JSON
+// A reply with no JSON at all is NOT an error -- the reviewer continues
+// with prose-only plan (legacy behavior, pre-checklist) and st.plan
+// stays nil. Extracted from the ask_planner inline path so the contract
+// can be exercised end-to-end without spinning up a real planner LLM.
+// Closes audit-pass-1 COV-IMP-7.
+func installPlanFromReply(st *runState, reply string) {
+	parsed, perr := plan.Parse(reply)
+	if perr != nil {
+		st.trace.Emit(trace.KindInfo, map[string]any{
+			"plan_parse_error": perr.Error(),
+			"reply_bytes":      len(reply),
+		})
+		return
+	}
+	if parsed == nil {
+		// No JSON in the reply -- silent legacy path.
+		return
+	}
+	st.plan = parsed
+	st.trace.Emit(trace.KindInfo, map[string]any{
+		"plan_parsed":      true,
+		"phases":           len(parsed.Phases),
+		"acceptance_items": len(parsed.Acceptance),
+	})
+}
+
 // neutralizeEnvelopeTags replaces tag-like substrings inside model-controlled
 // tool output that could otherwise impersonate the orchestrator's own
 // <RESULT>...</RESULT> / <TOOL>...</TOOL> envelopes. A file deliberately
@@ -1432,27 +1463,7 @@ func (o *Orchestrator) executeROTool(ctx context.Context, st *runState, tb *tool
 				"context":    "ask_planner persist plan",
 			})
 		}
-		// Try to parse a structured Plan out of the planner's reply. The
-		// system prompt asks for a JSON block at the end; if present we
-		// store it on runState and start rendering the <CHECKLIST> block
-		// into every subsequent reviewer turn. A reply with no JSON is
-		// not an error -- the reviewer continues with prose-only plan
-		// (legacy behavior, pre-checklist) and st.plan stays nil.
-		if parsed, perr := plan.Parse(planText); perr != nil {
-			// Malformed JSON. Trace it and keep going; reviewer can ask
-			// the planner to retry on the next turn if needed.
-			st.trace.Emit(trace.KindInfo, map[string]any{
-				"plan_parse_error": perr.Error(),
-				"reply_bytes":      len(planText),
-			})
-		} else if parsed != nil {
-			st.plan = parsed
-			st.trace.Emit(trace.KindInfo, map[string]any{
-				"plan_parsed":      true,
-				"phases":           len(parsed.Phases),
-				"acceptance_items": len(parsed.Acceptance),
-			})
-		}
+		installPlanFromReply(st, planText)
 		// ask_planner does NOT count toward workOps: the done() guard wants
 		// to see real progress (code, writes, tests), and a planner call alone
 		// could otherwise satisfy the guard for a model that emits plan->done
