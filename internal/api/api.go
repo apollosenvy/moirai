@@ -1,4 +1,4 @@
-// Package api serves the agent-router HTTP interface.
+// Package api serves the moirai HTTP interface.
 package api
 
 import (
@@ -16,9 +16,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/aegis/agent-router/internal/modelmgr"
-	"github.com/aegis/agent-router/internal/models"
-	"github.com/aegis/agent-router/internal/orchestrator"
+	"github.com/aegis/moirai/internal/modelmgr"
+	"github.com/aegis/moirai/internal/models"
+	"github.com/aegis/moirai/internal/orchestrator"
 )
 
 // orchestratorErrorStatus maps an orchestrator error to the HTTP status the

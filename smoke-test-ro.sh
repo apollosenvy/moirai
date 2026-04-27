@@ -21,7 +21,7 @@
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
-BIN="${REPO_DIR}/bin/agent-router"
+BIN="${REPO_DIR}/bin/moirai"
 PORT="${AGENT_ROUTER_PORT:-5987}"
 
 # Stub LLM ports. AR_SMOKE_PORT_BASE chooses a fixed contiguous block; if
@@ -79,10 +79,10 @@ trap cleanup EXIT
 # -----------------------------------------------------------------------------
 # Build the daemon
 # -----------------------------------------------------------------------------
-echo "[smoke-ro] building agent-router..."
+echo "[smoke-ro] building moirai..."
 cd "$REPO_DIR"
 mkdir -p bin
-go build -o "$BIN" ./cmd/agent-router
+go build -o "$BIN" ./cmd/moirai
 
 # -----------------------------------------------------------------------------
 # Write the Python stub (llama-server mock)

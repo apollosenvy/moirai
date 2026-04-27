@@ -1,4 +1,4 @@
-module github.com/aegis/agent-router
+module github.com/aegis/moirai
 
 go 1.26.2
 

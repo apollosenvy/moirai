@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aegis/agent-router/internal/taskstore"
+	"github.com/aegis/moirai/internal/taskstore"
 )
 
 // TestNoGoroutineLeakOnSubmitAbortCycle verifies the orchestrator does not

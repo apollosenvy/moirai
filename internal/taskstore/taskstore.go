@@ -175,6 +175,8 @@ func sanitizeTimestamps(t *Task) {
 
 func DefaultDir() string {
 	home, _ := os.UserHomeDir()
+	// TODO(rename): consider migrating to ~/.local/share/moirai/ in a future commit;
+	// orphaning existing trace data in production today.
 	return filepath.Join(home, ".local", "share", "agent-router", "tasks")
 }
 

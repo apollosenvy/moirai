@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end smoke test for agent-router.
+# End-to-end smoke test for moirai (formerly agent-router).
 #
 # Starts the daemon with three small placeholder GGUFs, submits a trivial
 # task, waits for it to finish, then prints the trace.
@@ -9,7 +9,7 @@
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
-BIN="${REPO_DIR}/bin/agent-router"
+BIN="${REPO_DIR}/bin/moirai"
 PORT="${AGENT_ROUTER_PORT:-5984}"
 TEST_REPO="$(mktemp -d /tmp/agent-router-smoke.XXXXXX)"
 CONFIG="$(mktemp /tmp/agent-router-smoke-config.XXXXXX.json)"
@@ -24,10 +24,10 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "[smoke] building agent-router..."
+echo "[smoke] building moirai..."
 cd "$REPO_DIR"
 mkdir -p bin
-go build -o "$BIN" ./cmd/agent-router
+go build -o "$BIN" ./cmd/moirai
 
 echo "[smoke] preparing test repo at $TEST_REPO"
 cd "$TEST_REPO"

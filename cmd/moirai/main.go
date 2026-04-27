@@ -1,4 +1,4 @@
-// agent-router: three-model coding daemon.
+// moirai: three-model coding daemon. (Project was previously known as agent-router.)
 //
 // Subcommands:
 //   daemon              run the HTTP daemon
@@ -9,6 +9,8 @@
 //
 // Config precedence:
 //   --config=PATH > $AGENT_ROUTER_CONFIG > ~/.config/agent-router/config.json
+// TODO(rename): consider migrating to ~/.config/moirai/ in a future commit;
+// orphaning existing trace data in production today.
 //
 // Defaults live in defaultConfig() below; they target Gary's Aegis box.
 package main
@@ -31,12 +33,12 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/aegis/agent-router/internal/aegis"
-	"github.com/aegis/agent-router/internal/api"
-	"github.com/aegis/agent-router/internal/modelmgr"
-	"github.com/aegis/agent-router/internal/orchestrator"
-	"github.com/aegis/agent-router/internal/proctitle"
-	"github.com/aegis/agent-router/internal/taskstore"
+	"github.com/aegis/moirai/internal/aegis"
+	"github.com/aegis/moirai/internal/api"
+	"github.com/aegis/moirai/internal/modelmgr"
+	"github.com/aegis/moirai/internal/orchestrator"
+	"github.com/aegis/moirai/internal/proctitle"
+	"github.com/aegis/moirai/internal/taskstore"
 )
 
 type Config struct {
@@ -68,6 +70,8 @@ type Config struct {
 
 func defaultConfig() Config {
 	home, _ := os.UserHomeDir()
+	// TODO(rename): consider migrating to ~/.local/share/moirai/ in a future commit;
+	// orphaning existing trace data in production today.
 	base := filepath.Join(home, ".local", "share", "agent-router")
 	// Shared TurboQuant KV + reasoning flags. The llama-cpp-turboquant binary
 	// supports -ctk/-ctv turbo3 for KV compression. Reasoning flags apply to
@@ -132,6 +136,8 @@ func loadConfig(path string) (Config, error) {
 	}
 	if path == "" {
 		home, _ := os.UserHomeDir()
+		// TODO(rename): consider migrating to ~/.config/moirai/ in a future commit;
+		// orphaning existing config in production today.
 		candidate := filepath.Join(home, ".config", "agent-router", "config.json")
 		if _, err := os.Stat(candidate); err == nil {
 			path = candidate
@@ -239,14 +245,14 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, `agent-router: three-model coding daemon
+	fmt.Fprintln(os.Stderr, `moirai: three-model coding daemon
 
 usage:
-  agent-router daemon [--config PATH]
-  agent-router task "description" [--repo PATH]
-  agent-router inspect <task_id>
-  agent-router abort <task_id>
-  agent-router status
+  moirai daemon [--config PATH]
+  moirai task "description" [--repo PATH]
+  moirai inspect <task_id>
+  moirai abort <task_id>
+  moirai status
 
 The daemon serves HTTP on the configured port (default 5984).
 See README.md and SPEC_DEVIATIONS.md for details.`)
@@ -259,7 +265,7 @@ func cmdDaemon(args []string) {
 	cfgPath := fs.String("config", "", "path to config JSON")
 	fs.Parse(args)
 
-	_ = proctitle.Set("agent-router")
+	_ = proctitle.Set("moirai")
 
 	cfg, err := loadConfig(*cfgPath)
 	if err != nil {
@@ -376,7 +382,7 @@ func cmdDaemon(args []string) {
 	// signal and never lands on this channel.
 	httpErrCh := make(chan error, 1)
 	go func() {
-		fmt.Fprintf(os.Stderr, "agent-router listening on %s\n", httpSrv.Addr)
+		fmt.Fprintf(os.Stderr, "moirai listening on %s\n", httpSrv.Addr)
 		err := httpSrv.ListenAndServe()
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			httpErrCh <- err
@@ -385,9 +391,9 @@ func cmdDaemon(args []string) {
 
 	select {
 	case <-sigc:
-		fmt.Fprintln(os.Stderr, "\nagent-router: shutting down")
+		fmt.Fprintln(os.Stderr, "\nmoirai: shutting down")
 	case err := <-httpErrCh:
-		fmt.Fprintf(os.Stderr, "agent-router: http listener failed: %v\n", err)
+		fmt.Fprintf(os.Stderr, "moirai: http listener failed: %v\n", err)
 		// Best-effort cleanup before exiting non-zero.
 		if shErr := orch.Shutdown(2 * time.Second); shErr != nil {
 			fmt.Fprintf(os.Stderr, "orchestrator shutdown: %v\n", shErr)
@@ -420,7 +426,7 @@ func cmdTask(args []string) {
 	fs.Parse(args)
 
 	if fs.NArg() == 0 {
-		fatal("usage: agent-router task \"description\" [--repo PATH]")
+		fatal("usage: moirai task \"description\" [--repo PATH]")
 	}
 	desc := strings.Join(fs.Args(), " ")
 
@@ -446,7 +452,7 @@ func cmdInspect(args []string) {
 	port := fs.Int("port", 5984, "daemon port")
 	fs.Parse(args)
 	if fs.NArg() == 0 {
-		fatal("usage: agent-router inspect <task_id>")
+		fatal("usage: moirai inspect <task_id>")
 	}
 	id := fs.Arg(0)
 	resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/tasks/%s", *port, id))
@@ -462,7 +468,7 @@ func cmdAbort(args []string) {
 	port := fs.Int("port", 5984, "daemon port")
 	fs.Parse(args)
 	if fs.NArg() == 0 {
-		fatal("usage: agent-router abort <task_id>")
+		fatal("usage: moirai abort <task_id>")
 	}
 	id := fs.Arg(0)
 	req, _ := http.NewRequest("POST", fmt.Sprintf("http://127.0.0.1:%d/tasks/%s/abort", *port, id), nil)
@@ -517,19 +523,23 @@ func daemonUp(port int) bool {
 }
 
 func fatal(f string, args ...any) {
-	fmt.Fprintf(os.Stderr, "agent-router: "+f+"\n", args...)
+	fmt.Fprintf(os.Stderr, "moirai: "+f+"\n", args...)
 	os.Exit(1)
 }
 
 // daemonLockPath returns the path to the daemon's PID file. Lives next to
-// the rest of agent-router state (~/.local/share/agent-router/daemon.pid)
+// the rest of moirai state (~/.local/share/agent-router/daemon.pid)
 // so a fresh checkout on a clean machine still works without operator
 // setup.
+// TODO(rename): consider migrating to ~/.local/share/moirai/ in a future commit;
+// orphaning existing daemon state in production today.
 func daemonLockPath() string {
 	if env := os.Getenv("AGENT_ROUTER_LOCK"); env != "" {
 		return env
 	}
 	home, _ := os.UserHomeDir()
+	// TODO(rename): consider migrating to ~/.local/share/moirai/ in a future commit;
+	// orphaning existing daemon.pid in production today.
 	return filepath.Join(home, ".local", "share", "agent-router", "daemon.pid")
 }
 
@@ -621,7 +631,7 @@ func acquireDaemonLock() (string, func(), error) {
 		}
 		// Stale lockfile -- previous daemon died without releasing. Remove
 		// and retry. Logged so operators can see the recovery.
-		fmt.Fprintf(os.Stderr, "agent-router: stale lockfile %s (pid %d not alive); removing\n", path, pid)
+		fmt.Fprintf(os.Stderr, "moirai: stale lockfile %s (pid %d not alive); removing\n", path, pid)
 		if rmErr := os.Remove(path); rmErr != nil {
 			return "", func() {}, fmt.Errorf("daemon lock: remove stale: %w", rmErr)
 		}

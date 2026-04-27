@@ -75,7 +75,7 @@ btop/ps). Falls back to os.Args[0] manipulation if cgo is off.
 ## Git commit tool
 Spec lists git.commit() as an allowed tool. The daemon never pushes, never
 force-resets, never amends. Commits happen on an agent-created local branch
-(`agent-router/task-<id>`). Gary merges manually.
+(`moirai/task-<id>`). Gary merges manually.
 
 ## 2026-04-22 RO Rewrite: Architecture pivot to LLM-as-orchestrator
 

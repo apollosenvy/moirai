@@ -45,13 +45,13 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/aegis/agent-router/internal/aegis"
-	"github.com/aegis/agent-router/internal/modelmgr"
-	"github.com/aegis/agent-router/internal/plan"
-	"github.com/aegis/agent-router/internal/repoconfig"
-	"github.com/aegis/agent-router/internal/taskstore"
-	"github.com/aegis/agent-router/internal/toolbox"
-	"github.com/aegis/agent-router/internal/trace"
+	"github.com/aegis/moirai/internal/aegis"
+	"github.com/aegis/moirai/internal/modelmgr"
+	"github.com/aegis/moirai/internal/plan"
+	"github.com/aegis/moirai/internal/repoconfig"
+	"github.com/aegis/moirai/internal/taskstore"
+	"github.com/aegis/moirai/internal/toolbox"
+	"github.com/aegis/moirai/internal/trace"
 )
 
 // Sentinel errors surfaced by Submit and Abort. The HTTP layer maps these to
@@ -449,7 +449,7 @@ func (o *Orchestrator) Submit(ctx context.Context, description, repoRoot string)
 		ID:          id,
 		Description: description,
 		RepoRoot:    abs,
-		Branch:      fmt.Sprintf("agent-router/task-%s", id),
+		Branch:      fmt.Sprintf("moirai/task-%s", id),
 		Status:      taskstore.StatusRunning,
 		Phase:       taskstore.PhaseInit,
 		CreatedAt:   time.Now().UTC(),
@@ -828,7 +828,7 @@ func (o *Orchestrator) run(ctx context.Context, st *runState) {
 	}
 
 	// Final commit on branch; never push.
-	msg := fmt.Sprintf("agent-router: %s\n\nTask: %s\n", shorten(t.Description, 72), t.ID)
+	msg := fmt.Sprintf("moirai: %s\n\nTask: %s\n", shorten(t.Description, 72), t.ID)
 	if _, err := tb.GitCommit(ctx, msg); err != nil {
 		tr.Emit(trace.KindInfo, map[string]any{"commit_skipped": err.Error()})
 	} else {
@@ -2226,6 +2226,9 @@ SURGICAL CHANGES (retry-mode discipline):
 	return base
 }
 
+// TODO(rename): the prompt below references the audit-mode checklist
+// directory ".agent-router/" by literal path. When the on-disk dir migrates
+// to ".moirai/", update the prompt strings here too.
 func roSystemPrompt() string {
 	return `You are the Reviewer-Orchestrator.
 You coordinate the Planner (P) and the Coder (C) to complete the user's task.

@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/aegis/agent-router/internal/modelmgr"
+	"github.com/aegis/moirai/internal/modelmgr"
 )
 
 // makeAskCoderResultMsg builds a fake user-role message looking like an

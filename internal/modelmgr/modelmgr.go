@@ -145,6 +145,8 @@ func New(cfg Config) (*Manager, error) {
 		cfg.BootTimeout = 60 * time.Second
 	}
 	if cfg.LogDir == "" {
+		// TODO(rename): consider migrating to moirai-llama-logs in a future commit;
+		// orphaning existing log dir in production today.
 		cfg.LogDir = filepath.Join(os.TempDir(), "agent-router-llama-logs")
 	}
 	if err := os.MkdirAll(cfg.LogDir, 0o700); err != nil {
@@ -517,9 +519,9 @@ func (m *Manager) start(ctx context.Context, slot Slot, cfg *ModelConfig) error 
 	env := os.Environ()
 	if smithyPath, err := ensureSmithyProfile(ctx, cfg.ModelPath); err == nil && smithyPath != "" {
 		env = append(env, "SMITHY_CONFIG="+smithyPath)
-		fmt.Fprintf(logFile, "[agent-router] SMITHY_CONFIG=%s\n", smithyPath)
+		fmt.Fprintf(logFile, "[moirai] SMITHY_CONFIG=%s\n", smithyPath)
 	} else if err != nil {
-		fmt.Fprintf(logFile, "[agent-router] smithy profile unavailable: %v\n", err)
+		fmt.Fprintf(logFile, "[moirai] smithy profile unavailable: %v\n", err)
 		fmt.Fprintf(os.Stderr, "modelmgr: smithy profile unavailable for slot %s: %v\n", slot, err)
 	}
 

@@ -1,6 +1,7 @@
-# agent-router — Build Spec
+# moirai — Build Spec
 
-Working name. Rename at will.
+Previously known as `agent-router`. Filesystem paths still reference the old
+name on purpose; rename is mechanical for the code only.
 
 ## What this is
 
@@ -56,7 +57,7 @@ Iteration cap: 3 coder retries per plan, then one replan, then fail-logged.
 
 ```
                     ┌─────────────────────────────┐
-                    │  agent-router daemon (Go)   │
+                    │  moirai daemon (Go)         │
                     │  HTTP :59NN, CLI entry      │
                     └──┬───────────┬───────────┬──┘
                        │           │           │
@@ -150,7 +151,7 @@ max_iterations = 6
 These are what make it a daily driver vs. a demo:
 
 1. **Diff-gate.** Never auto-push. Final artifact is a local branch + diff. Human reviews and merges.
-2. **Interrupt/inspect.** `agent-router inspect <task_id>` shows current phase, active model, last 20 tool calls. `agent-router abort <task_id>` kills cleanly, state persists for postmortem.
+2. **Interrupt/inspect.** `moirai inspect <task_id>` shows current phase, active model, last 20 tool calls. `moirai abort <task_id>` kills cleanly, state persists for postmortem.
 3. **Resume.** If daemon crashes mid-task, on restart task resumes at last phase boundary. State serialized per phase.
 4. **Sandbox.** Shell + file operations jailed to repo root via `bwrap` or cgroup. Network off by default. Whitelistable per-repo if needed.
 5. **Trace.** JSONL log per task at `~/.local/share/agent-router/traces/<task_id>.jsonl`. Every LLM call, every tool invocation, every verdict. Tail-able.
@@ -249,8 +250,8 @@ Existing files already in this dir that predate this spec:
 
 ## Success looks like
 
-A git repo at `~/Projects/agent-router/` containing:
-- Working Go daemon (`cmd/agent-router/main.go` builds and runs)
+A git repo at `~/Projects/moirai/` containing:
+- Working Go daemon (`cmd/moirai/main.go` builds and runs)
 - Three llama-server configs for A/B/C with hot-swap
 - Tool box with sandbox
 - AEGIS integration

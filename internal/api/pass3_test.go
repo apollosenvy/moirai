@@ -7,8 +7,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/aegis/agent-router/internal/orchestrator"
-	"github.com/aegis/agent-router/internal/taskstore"
+	"github.com/aegis/moirai/internal/orchestrator"
+	"github.com/aegis/moirai/internal/taskstore"
 )
 
 // TestSubmitWhitespaceDescReturns400 covers pass-3 B4: a description that's

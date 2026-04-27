@@ -1,8 +1,8 @@
 package orchestrator
 
 import (
-	"github.com/aegis/agent-router/internal/taskstore"
-	"github.com/aegis/agent-router/internal/trace"
+	"github.com/aegis/moirai/internal/taskstore"
+	"github.com/aegis/moirai/internal/trace"
 )
 
 // SeedRunningForTest registers a fake running task on the orchestrator and

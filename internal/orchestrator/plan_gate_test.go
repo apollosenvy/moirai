@@ -9,10 +9,10 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/aegis/agent-router/internal/modelmgr"
-	"github.com/aegis/agent-router/internal/plan"
-	"github.com/aegis/agent-router/internal/taskstore"
-	"github.com/aegis/agent-router/internal/trace"
+	"github.com/aegis/moirai/internal/modelmgr"
+	"github.com/aegis/moirai/internal/plan"
+	"github.com/aegis/moirai/internal/taskstore"
+	"github.com/aegis/moirai/internal/trace"
 )
 
 // TestDoneGateRefusesUnsatisfiedAcceptance addresses pass-2 finding

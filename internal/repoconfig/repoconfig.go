@@ -1,4 +1,6 @@
 // Package repoconfig parses .agent-router.toml files at repo roots.
+// TODO(rename): consider migrating to .moirai.toml in a future commit;
+// orphaning existing per-repo config files in production today.
 //
 // Minimal TOML-ish parser. We only support the subset the spec calls for
 // ([commands], [style], [forbidden], [budget]) so we don't pull in a full
@@ -62,6 +64,8 @@ func defaults() Config {
 // which then bubbled up to the orchestrator and failed the entire task.
 // 30-line config files do not need streaming; one ReadFile is fine.
 func Load(repoRoot string) (Config, bool, error) {
+	// TODO(rename): consider migrating to .moirai.toml in a future commit;
+	// orphaning existing per-repo config files in production today.
 	path := filepath.Join(repoRoot, ".agent-router.toml")
 	data, err := os.ReadFile(path)
 	if err != nil {

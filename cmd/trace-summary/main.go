@@ -1,4 +1,4 @@
-// trace-summary reads an agent-router trace.jsonl and produces a one-page
+// trace-summary reads a moirai trace.jsonl and produces a one-page
 // rematch health report: turn count, file/acceptance tick rate, failure
 // mode, time-per-turn, source breakdown for ticks. Written for the
 // rematch-protocol post-mortem cycle so a session reviewing rematch

@@ -34,7 +34,7 @@ func Set(name string) error {
 }
 
 // overwriteArgv0 replaces the first argv slot in the process's memory.
-// Makes the daemon show as "agent-router" in btop/htop/ps instead of the
+// Makes the daemon show as "moirai" in btop/htop/ps instead of the
 // full go binary path.
 func overwriteArgv0(name string) {
 	if len(os.Args) == 0 {

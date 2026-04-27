@@ -1,4 +1,10 @@
-# agent-router
+# moirai
+
+> Previously known as `agent-router`. The rename is mechanical; on-disk
+> filesystem paths (`~/.config/agent-router/`, `~/.local/share/agent-router/`,
+> `.agent-router.toml`) are intentionally left unchanged in this commit so
+> existing trace data, configs, and per-repo settings keep working. They will
+> migrate in a follow-up commit.
 
 A three-model local coding daemon. Planner, Coder, and Reviewer run as
 `llama-server` instances on a single 7900 XTX, swapped through VRAM one at a
@@ -12,7 +18,7 @@ that diverged from the whiteboard.
 Go 1.26 or newer.
 
 ```bash
-go build -o bin/agent-router ./cmd/agent-router
+go build -o bin/moirai ./cmd/moirai
 ```
 
 Produces a single ~14 MB static binary. No external runtime deps beyond
@@ -75,26 +81,26 @@ trace-diff <baseline-task>.jsonl <candidate-task>.jsonl
 2. Start the daemon:
 
    ```bash
-   bin/agent-router daemon
+   bin/moirai daemon
    ```
 
-   It listens on `127.0.0.1:5984` (HTTP) and shows up as `agent-router` in
+   It listens on `127.0.0.1:5984` (HTTP) and shows up as `moirai` in
    `btop`/`htop`/`ps`.
 
 3. Submit a task:
 
    ```bash
-   bin/agent-router task "refactor the cache eviction logic to use LRU" --repo ~/Projects/some-repo
+   bin/moirai task "refactor the cache eviction logic to use LRU" --repo ~/Projects/some-repo
    ```
 
 4. Watch it work:
 
    ```bash
-   bin/agent-router inspect <task_id>
+   bin/moirai inspect <task_id>
    tail -f ~/.local/share/agent-router/traces/<task_id>.jsonl | jq .
    ```
 
-5. When it finishes, the diff lives on `agent-router/task-<id>`. You merge,
+5. When it finishes, the diff lives on `moirai/task-<id>`. You merge,
    you rebase, you throw it away. The daemon never pushes.
 
 ## Subcommands

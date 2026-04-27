@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/aegis/agent-router/internal/repoconfig"
+	"github.com/aegis/moirai/internal/repoconfig"
 )
 
 // TestEnsureRepoInitsFreshDir exercises the "A/B parity with Forge" code
@@ -28,7 +28,7 @@ func TestEnsureRepoInitsFreshDir(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	tb, err := New(dir, "agent-router/task-x", t.TempDir(), repoconfig.Config{}, false)
+	tb, err := New(dir, "moirai/task-x", t.TempDir(), repoconfig.Config{}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,7 +78,7 @@ func TestEnsureRepoIdempotent(t *testing.T) {
 	}
 	before, _ := exec.Command("git", "-C", dir, "rev-parse", "HEAD").Output()
 
-	tb, _ := New(dir, "agent-router/task-y", t.TempDir(), repoconfig.Config{}, false)
+	tb, _ := New(dir, "moirai/task-y", t.TempDir(), repoconfig.Config{}, false)
 	if err := tb.EnsureRepo(context.Background()); err != nil {
 		t.Fatalf("EnsureRepo on existing repo: %v", err)
 	}
@@ -127,7 +127,7 @@ func TestEnsureRepoPreservesExistingIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	tb, err := New(dir, "agent-router/task-z", t.TempDir(), repoconfig.Config{}, false)
+	tb, err := New(dir, "moirai/task-z", t.TempDir(), repoconfig.Config{}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -155,7 +155,7 @@ func TestEnsureRepoEmptyDir(t *testing.T) {
 	t.Setenv("GIT_CONFIG_SYSTEM", "/dev/null")
 	dir := t.TempDir()
 
-	tb, err := New(dir, "agent-router/task-empty", t.TempDir(), repoconfig.Config{}, false)
+	tb, err := New(dir, "moirai/task-empty", t.TempDir(), repoconfig.Config{}, false)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -11,6 +11,7 @@ import (
 func writeConfig(t *testing.T, body string) string {
 	t.Helper()
 	dir := t.TempDir()
+	// TODO(rename): mirrors repoconfig.Load() filesystem path; migrate together.
 	if err := os.WriteFile(filepath.Join(dir, ".agent-router.toml"), []byte(body), 0o644); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}

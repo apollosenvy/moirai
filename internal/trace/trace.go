@@ -1,4 +1,6 @@
 // Package trace writes JSONL traces to ~/.local/share/agent-router/traces/.
+// TODO(rename): consider migrating to ~/.local/share/moirai/ in a future commit;
+// orphaning existing trace data in production today.
 // One file per task. Every LLM call, tool invocation, phase change, and
 // verdict is logged. Tail-able with `tail -f` and `jq`.
 package trace
@@ -46,6 +48,8 @@ type Writer struct {
 }
 
 // Dir returns the default trace directory.
+// TODO(rename): consider migrating to ~/.local/share/moirai/ in a future commit;
+// orphaning existing trace data in production today.
 func Dir() string {
 	home, _ := os.UserHomeDir()
 	return filepath.Join(home, ".local", "share", "agent-router", "traces")

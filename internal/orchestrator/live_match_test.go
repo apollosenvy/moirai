@@ -9,11 +9,11 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/aegis/agent-router/internal/plan"
-	"github.com/aegis/agent-router/internal/repoconfig"
-	"github.com/aegis/agent-router/internal/taskstore"
-	"github.com/aegis/agent-router/internal/toolbox"
-	"github.com/aegis/agent-router/internal/trace"
+	"github.com/aegis/moirai/internal/plan"
+	"github.com/aegis/moirai/internal/repoconfig"
+	"github.com/aegis/moirai/internal/taskstore"
+	"github.com/aegis/moirai/internal/toolbox"
+	"github.com/aegis/moirai/internal/trace"
 )
 
 // TestAutoExtractAndCommitTicksPlan exercises the FULL auto-extract path

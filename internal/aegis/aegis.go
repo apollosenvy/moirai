@@ -3,6 +3,8 @@
 // L1: in-process task state (the orchestrator holds this directly; we just
 //     expose token-budget helpers).
 // L2: per-repo SQLite DB at ~/.local/share/agent-router/repo-memory.db.
+//     TODO(rename): consider migrating to ~/.local/share/moirai/ in a future commit;
+//     orphaning existing repo-memory data in production today.
 // L3: engram-emit CLI for writes, pensive-recall CLI for reads.
 //
 // Subagent trust rules apply: nothing in this package ever deletes.
@@ -31,6 +33,8 @@ type L2 struct {
 
 func l2Path() string {
 	home, _ := os.UserHomeDir()
+	// TODO(rename): consider migrating to ~/.local/share/moirai/ in a future commit;
+	// orphaning existing repo-memory.db in production today.
 	return filepath.Join(home, ".local", "share", "agent-router", "repo-memory.db")
 }
 

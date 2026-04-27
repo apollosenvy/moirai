@@ -13,8 +13,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aegis/agent-router/internal/modelmgr"
-	"github.com/aegis/agent-router/internal/taskstore"
+	"github.com/aegis/moirai/internal/modelmgr"
+	"github.com/aegis/moirai/internal/taskstore"
 )
 
 // failingModelMgr fails EnsureSlot immediately so the run goroutine takes
@@ -332,6 +332,9 @@ func TestTraceFDReleasedOnTerminalStates(t *testing.T) {
 		if err != nil {
 			continue
 		}
+		// TODO(rename): substring matches the trace-dir filesystem path
+		// ~/.local/share/agent-router/. When that dir migrates to .../moirai/,
+		// update this check too.
 		if strings.HasSuffix(target, ".jsonl") && strings.Contains(target, "agent-router") {
 			t.Errorf("trace fd still open: %s (fd %s)", target, e.Name())
 		}

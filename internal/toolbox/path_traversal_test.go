@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/aegis/agent-router/internal/repoconfig"
+	"github.com/aegis/moirai/internal/repoconfig"
 )
 
 // makeToolbox builds a Toolbox rooted at a fresh tempdir. We do NOT call

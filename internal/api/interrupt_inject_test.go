@@ -9,10 +9,10 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/aegis/agent-router/internal/modelmgr"
-	"github.com/aegis/agent-router/internal/orchestrator"
-	"github.com/aegis/agent-router/internal/taskstore"
-	"github.com/aegis/agent-router/internal/trace"
+	"github.com/aegis/moirai/internal/modelmgr"
+	"github.com/aegis/moirai/internal/orchestrator"
+	"github.com/aegis/moirai/internal/taskstore"
+	"github.com/aegis/moirai/internal/trace"
 )
 
 // stubModelMgr is a no-op ModelManager for tests that don't exercise a real

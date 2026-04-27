@@ -23,7 +23,7 @@ func TestSaveAndLoadRoundTrip(t *testing.T) {
 		ID:          "T-1",
 		Description: "do the thing",
 		RepoRoot:    "/tmp/repo",
-		Branch:      "agent-router/task-T-1",
+		Branch:      "moirai/task-T-1",
 		Status:      StatusRunning,
 		Phase:       PhaseInit,
 	}

@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aegis/agent-router/internal/repoconfig"
+	"github.com/aegis/moirai/internal/repoconfig"
 )
 
 // TestFSSearchForbiddenFilter verifies SEC-PASS5-001: fs.search must drop

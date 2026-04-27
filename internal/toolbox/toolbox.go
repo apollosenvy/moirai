@@ -4,6 +4,8 @@
 // through a local git branch. Shell commands route through the sandbox.
 // Forbidden paths from .agent-router.toml are enforced here, not just as a
 // suggestion to the model.
+// TODO(rename): consider migrating to .moirai.toml in a future commit;
+// orphaning existing per-repo config files in production today.
 package toolbox
 
 import (
@@ -14,13 +16,13 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/aegis/agent-router/internal/repoconfig"
-	"github.com/aegis/agent-router/internal/sandbox"
+	"github.com/aegis/moirai/internal/repoconfig"
+	"github.com/aegis/moirai/internal/sandbox"
 )
 
 type Toolbox struct {
 	RepoRoot     string
-	Branch       string // the working branch (agent-router/task-<id>)
+	Branch       string // the working branch (moirai/task-<id>)
 	Cfg          repoconfig.Config
 	ScratchDir   string
 	AllowNetwork bool
@@ -251,7 +253,7 @@ func (t *Toolbox) FSSearch(ctx context.Context, pattern, path string, maxHits in
 	// rg returns 1 when no matches; both are fine.
 	//
 	// SEC-PASS5-001: ripgrep walks the search root recursively and has no
-	// awareness of the [forbidden].paths list in .agent-router.toml. Hits
+	// awareness of the [forbidden].paths list in .agent-router.toml (TODO(rename): .moirai.toml). Hits
 	// from forbidden subdirectories must be dropped here, post-parse, even
 	// though resolveInsideRepo already vetted the search root itself. A
 	// pattern like "BEGIN PRIVATE KEY" rooted at "." would otherwise
@@ -353,7 +355,7 @@ func (t *Toolbox) GitBranch(ctx context.Context) (string, error) {
 //
 // An identity is configured at the local-repo level only if the user has
 // no global identity, so we don't stomp on existing git config. The
-// synthesized identity ("agent-router@localhost") makes the initial
+// synthesized identity ("moirai@localhost") makes the initial
 // commit possible; real commits from the agent later still use the
 // user's global identity if they set one afterward.
 func (t *Toolbox) EnsureRepo(ctx context.Context) error {
@@ -370,10 +372,10 @@ func (t *Toolbox) EnsureRepo(ctx context.Context) error {
 	// Seed identity only if neither env vars nor global config provide one.
 	// `git config --get` returns code 1 when the key is unset.
 	if _, _, code, _ := t.git(ctx, "config", "user.email"); code != 0 {
-		_, _, _, _ = t.git(ctx, "config", "user.email", "agent-router@localhost")
+		_, _, _, _ = t.git(ctx, "config", "user.email", "moirai@localhost")
 	}
 	if _, _, code, _ := t.git(ctx, "config", "user.name"); code != 0 {
-		_, _, _, _ = t.git(ctx, "config", "user.name", "agent-router")
+		_, _, _, _ = t.git(ctx, "config", "user.name", "moirai")
 	}
 
 	// Stage everything that's already there (including .gitignore if any)
@@ -384,7 +386,7 @@ func (t *Toolbox) EnsureRepo(ctx context.Context) error {
 	} else if code != 0 {
 		return fmt.Errorf("git add (init): %s", errStr)
 	}
-	if _, errStr, code, err := t.git(ctx, "commit", "--allow-empty", "-m", "agent-router: initial snapshot"); err != nil {
+	if _, errStr, code, err := t.git(ctx, "commit", "--allow-empty", "-m", "moirai: initial snapshot"); err != nil {
 		return err
 	} else if code != 0 {
 		return fmt.Errorf("git commit (init): %s", errStr)
@@ -426,6 +428,8 @@ func (t *Toolbox) GitCommit(ctx context.Context, message string) (string, error)
 	// would round-trip through the RO model and self-DoS the task here
 	// (commit fails for a reason the operator did not introduce). See
 	// SPEC_DEVIATIONS.md "Em dash in commit messages" for context.
+	// TODO(rename): consider migrating to .moirai.toml in a future commit;
+	// orphaning existing per-repo config files in production today.
 	if _, _, code, err := t.git(ctx, "add", "-A", ":(exclude).agent-router.toml"); err != nil {
 		return "", err
 	} else if code != 0 {

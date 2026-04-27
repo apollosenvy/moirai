@@ -11,9 +11,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aegis/agent-router/internal/modelmgr"
-	"github.com/aegis/agent-router/internal/taskstore"
-	"github.com/aegis/agent-router/internal/trace"
+	"github.com/aegis/moirai/internal/modelmgr"
+	"github.com/aegis/moirai/internal/taskstore"
+	"github.com/aegis/moirai/internal/trace"
 )
 
 func newTestOrch(t *testing.T) *Orchestrator {
@@ -413,7 +413,7 @@ func TestAbortDuringRun(t *testing.T) {
 		ID:       id,
 		Status:   taskstore.StatusRunning,
 		RepoRoot: repoDir,
-		Branch:   fmt.Sprintf("agent-router/task-%s", id),
+		Branch:   fmt.Sprintf("moirai/task-%s", id),
 	}
 	_ = store.Save(task)
 	tr, err := trace.Open(id)

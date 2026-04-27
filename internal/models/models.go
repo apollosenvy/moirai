@@ -1,4 +1,4 @@
-// Package models enumerates GGUF model files available to agent-router.
+// Package models enumerates GGUF model files available to moirai.
 //
 // head_dim and detected_ctx_max are best-effort: if we can't parse the GGUF
 // header, we leave them zero and the caller decides how to render that.

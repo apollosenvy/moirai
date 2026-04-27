@@ -15,6 +15,7 @@ func withTempTraceDir(t *testing.T) string {
 	dir := t.TempDir()
 	t.Setenv("HOME", dir)
 	// Dir() resolves $HOME each call; no further wiring needed.
+	// TODO(rename): mirrors trace.Dir() filesystem path; migrate together.
 	return filepath.Join(dir, ".local", "share", "agent-router", "traces")
 }
 
