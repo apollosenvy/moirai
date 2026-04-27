@@ -12,19 +12,22 @@ import (
 // the planner stops emitting parseable plans and st.plan stays nil
 // forever -- a SILENT failure mode (plan injection just doesn't fire).
 //
-// Pin the substrings the parsers and matchers depend on.
+// Pin the substrings the parsers and matchers depend on, plus the
+// Karpathy-derived behavioral guidance (Think Before, Goal-Driven).
 func TestPlannerSystemPromptContainsParserContract(t *testing.T) {
 	prompt := plannerSystemPrompt()
 	for _, want := range []string{
-		"json",                // requires fenced JSON output
-		"phases",              // top-level field plan.Plan.Phases
-		"acceptance",          // top-level field plan.Plan.Acceptance
-		"verify",              // AcceptanceItem.Verify field
-		"file:",               // verify shape that auto-ticks on fs.write
-		"test.run:pass",       // verify shape that auto-ticks on test.run
-		"compile.run:pass",    // verify shape that auto-ticks on compile.run
-		"PATH DISCIPLINE",     // path-canonicalization guidance shipped d4f3d8b
-		"PHASE GRANULARITY",   // phase-sizing guidance shipped d4f3d8b
+		"json",                       // requires fenced JSON output
+		"phases",                     // top-level field plan.Plan.Phases
+		"acceptance",                 // top-level field plan.Plan.Acceptance
+		"verify",                     // AcceptanceItem.Verify field
+		"file:",                      // verify shape that auto-ticks on fs.write
+		"test.run:pass",              // verify shape that auto-ticks on test.run
+		"compile.run:pass",           // verify shape that auto-ticks on compile.run
+		"PATH DISCIPLINE",            // path-canonicalization guidance
+		"PHASE GRANULARITY",          // phase-sizing guidance
+		"THINK BEFORE PLANNING",      // Karpathy: surface assumptions
+		"GOAL-DRIVEN ACCEPTANCE",     // Karpathy: every criterion is a test
 	} {
 		if !strings.Contains(prompt, want) {
 			t.Errorf("plannerSystemPrompt missing required substring %q", want)
@@ -46,6 +49,8 @@ func TestCoderSystemPromptContainsExtractorContract(t *testing.T) {
 		"fenced",              // fence convention
 		"fs.write",            // negative instruction (don't emit JSON tool calls)
 		"BLANK LINES",         // multi-file separator convention
+		"SIMPLICITY FIRST",    // Karpathy: minimum code that solves the request
+		"speculative",         // negative pressure: no speculative abstractions
 	} {
 		if !strings.Contains(prompt, want) {
 			t.Errorf("coderSystemPrompt missing required substring %q", want)
@@ -63,6 +68,8 @@ func TestCoderSystemPromptRetryModeAddsFsAccess(t *testing.T) {
 		"RETRY MODE",
 		"fs.read",
 		"fs.search",
+		"SURGICAL CHANGES",   // Karpathy: minimal patch in retry mode
+		"minimal patch",      // explicit anti-rewrite framing
 	} {
 		if !strings.Contains(prompt, want) {
 			t.Errorf("coderSystemPrompt(retry=true) missing %q", want)
@@ -72,5 +79,23 @@ func TestCoderSystemPromptRetryModeAddsFsAccess(t *testing.T) {
 	// non-retry contract so the coder doesn't lose its format rules.
 	if !strings.Contains(prompt, "# file:") {
 		t.Error("retry-mode prompt should still carry the base format contract")
+	}
+}
+
+// TestReviewerSystemPromptContainsGoalDriven pins the Goal-Driven
+// Execution section in the reviewer prompt -- the Karpathy principle
+// that every dispatch carries its own success test. A regression that
+// drops this section silently lets the reviewer fall back to vibes
+// (dispatch "fix it" without a test, call done() without test.run).
+func TestReviewerSystemPromptContainsGoalDriven(t *testing.T) {
+	prompt := roSystemPrompt()
+	for _, want := range []string{
+		"GOAL-DRIVEN EXECUTION", // section header
+		"failing test",          // Karpathy: write failing test, then make it pass
+		"BEFORE done()",         // pressure to call test.run before terminating
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Errorf("roSystemPrompt missing required substring %q", want)
+		}
 	}
 }
