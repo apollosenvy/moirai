@@ -762,6 +762,57 @@ func unsatisfiedAcceptanceContextForCoder(p *plan.Plan) string {
 	return b.String()
 }
 
+// emitTaskEndAtom writes a structured atom to Pensive for cross-task
+// pattern recognition. Every terminated task (succeeded / failed /
+// aborted) gets ONE atom: the abstract shape (verdict, turn count,
+// file/acceptance progress) rather than the full task content. Future
+// sessions can pensive_recall to find "tasks like this one" and learn
+// from their outcomes.
+//
+// Best-effort: emit failures are logged but never fail the task.
+// Engram CLI not on PATH (typical in CI) is silently tolerated.
+//
+// Closes the design-review gap: the orchestrator emitted compaction
+// atoms during runs but never a per-task summary atom. Cross-task
+// learning was happening only through ad-hoc charon-emit calls Heph
+// made manually; the orchestrator is now the durable emitter.
+func (o *Orchestrator) emitTaskEndAtom(ctx context.Context, st *runState, t *taskstore.Task, verdict, summary string) {
+	project := "moirai"
+	if t != nil && t.RepoRoot != "" {
+		project = filepath.Base(t.RepoRoot)
+	}
+	// Compose a principle line that abstracts the run shape.
+	var fd, ft, ad, at int
+	if st != nil && st.plan != nil {
+		fd, ft, ad, at = st.plan.ProgressCounts()
+	}
+	var roTurns, askCoder, askPlanner, testPass, compilePass int
+	if st != nil {
+		roTurns = st.roTurns
+		askCoder = st.askCoderCalls
+		askPlanner = st.askPlannerCalls
+		testPass = st.testRunPassCount
+		compilePass = st.compileRunPassCount
+	}
+	principle := fmt.Sprintf(
+		"task %s ended %s after %d reviewer turns (planner=%d coder=%d test.run:pass=%d compile.run:pass=%d files=%d/%d acc=%d/%d)",
+		shorten(t.ID, 36), verdict,
+		roTurns, askPlanner, askCoder, testPass, compilePass,
+		fd, ft, ad, at,
+	)
+	contextStr := shorten(summary, 800)
+	tags := fmt.Sprintf("task-end,verdict:%s,project:%s", verdict, project)
+	// Best-effort emission: the run goroutine is exiting; we don't
+	// want a slow Engram write to extend the task lifetime, and a
+	// failure here is operationally unimportant (the trace JSONL
+	// remains the durable record).
+	emitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if _, err := aegis.PensiveEmit(emitCtx, "discovery", project, principle, contextStr, tags); err != nil {
+		log.Printf("orchestrator: pensive task-end atom for %s skipped: %v", t.ID, err)
+	}
+}
+
 // saveTaskOrLog persists the task and surfaces save errors via
 // log.Printf instead of swallowing them. Disk-full / permission
 // errors during failure handling are the worst time to be invisible
@@ -1020,6 +1071,7 @@ func (o *Orchestrator) run(ctx context.Context, st *runState) {
 	if o.cfg.L2 != nil {
 		_ = o.cfg.L2.RecordVerdict(t.RepoRoot, t.ID, "final", "succeeded", shorten(summary, 4000))
 	}
+	o.emitTaskEndAtom(ctx, st, t, "succeeded", summary)
 }
 
 // roLoop runs the RO as a tool-call driver until it emits done or fail, or
@@ -2192,6 +2244,7 @@ func (o *Orchestrator) fail(st *runState, t *taskstore.Task, tr *trace.Writer, e
 			"verdict": "aborted",
 			"reason":  err.Error(),
 		})
+		o.emitTaskEndAtom(context.Background(), st, t, "aborted", err.Error())
 		return
 	}
 	t.Status = taskstore.StatusFailed
@@ -2207,6 +2260,12 @@ func (o *Orchestrator) fail(st *runState, t *taskstore.Task, tr *trace.Writer, e
 	if o.cfg.L2 != nil {
 		_ = o.cfg.L2.RecordVerdict(t.RepoRoot, t.ID, "final", "failed", shorten(err.Error(), 4000))
 	}
+	// Pensive task-end atom for cross-task pattern recognition. Use
+	// Background ctx since fail() runs at the END of the run goroutine
+	// where the task ctx may already be cancelled (the cancellation is
+	// often what triggered the fail). emitTaskEndAtom wraps a 5s
+	// timeout internally so this can't extend the run lifetime.
+	o.emitTaskEndAtom(context.Background(), st, t, string(t.Status), err.Error())
 }
 
 // --- system prompts --------------------------------------------------------
