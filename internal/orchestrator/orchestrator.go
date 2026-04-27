@@ -679,6 +679,43 @@ const (
 	consecutiveFsWriteSoftCap = 5
 )
 
+// unsatisfiedAcceptanceContextForCoder produces a short prose block
+// listing the unsatisfied acceptance items the coder's work needs to
+// satisfy, so the coder writes code AGAINST a goal rather than only
+// against the reviewer's free-form instruction. Returns empty string
+// when no plan is loaded or all acceptance is already ticked, in
+// which case the prompt template inserts nothing.
+//
+// Format keeps the auto-tick shapes (test.run:pass / compile.run:pass /
+// file:<path>) verbatim so the coder can read them as concrete success
+// criteria, not vibes.
+//
+// Closes the AAR finding that the Coder is "goal-blind": reviewer's
+// GOAL-DRIVEN EXECUTION rule says "name the test that proves it done"
+// but the orchestrator never enforced surfacing the test surface to
+// the actual model doing the work.
+func unsatisfiedAcceptanceContextForCoder(p *plan.Plan) string {
+	if p == nil || len(p.Acceptance) == 0 {
+		return ""
+	}
+	var unmet []plan.AcceptanceItem
+	for _, a := range p.Acceptance {
+		if !a.Satisfied {
+			unmet = append(unmet, a)
+		}
+	}
+	if len(unmet) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("\nActive acceptance criteria your code must satisfy (auto-ticked when the verify shape matches):\n")
+	for _, a := range unmet {
+		fmt.Fprintf(&b, "  - %s: %s  [verify: %s]\n", a.ID, a.Description, a.Verify)
+	}
+	b.WriteString("\n")
+	return b.String()
+}
+
 // isAuditStateFilePath reports whether the given path is a permitted
 // audit-mode write target. In AUDIT-ONLY mode the orchestrator allows
 // writes ONLY to the two audit state files referenced by the reviewer's
@@ -1921,9 +1958,17 @@ func (o *Orchestrator) callCoder(ctx context.Context, st *runState, tb *toolbox.
 	tr.Emit(trace.KindSwap, map[string]any{"to": "coder", "reason": "ask_coder", "retry_mode": retryMode})
 
 	system := coderSystemPrompt(retryMode)
+	// Orchestrator-side enforcement of the reviewer prompt's
+	// GOAL-DRIVEN EXECUTION rule ("name the test that proves it"):
+	// surface the unsatisfied acceptance items the coder's work needs
+	// to make tickable. The reviewer can dispatch ask_coder without
+	// remembering to include this; doing it here makes the goal
+	// visible to the coder regardless. Empty when no plan is loaded
+	// or all acceptance is already satisfied.
+	acceptanceCtx := unsatisfiedAcceptanceContextForCoder(st.plan)
 	user := fmt.Sprintf(
-		"Task:\n%s\n\nRepo root: %s\n\nPlan:\n%s\n\nInstruction from the Reviewer-Orchestrator:\n%s\n\nProduce the code now. Emit each file as a markdown-fenced block. The first line INSIDE the fence must be a comment naming the path, like:\n```python\n# file: src/foo.py\n...code...\n```",
-		st.task.Description, st.task.RepoRoot, shorten(plan, 20000), instruction,
+		"Task:\n%s\n\nRepo root: %s\n\nPlan:\n%s\n%sInstruction from the Reviewer-Orchestrator:\n%s\n\nProduce the code now. Emit each file as a markdown-fenced block. The first line INSIDE the fence must be a comment naming the path, like:\n```python\n# file: src/foo.py\n...code...\n```",
+		st.task.Description, st.task.RepoRoot, shorten(plan, 20000), acceptanceCtx, instruction,
 	)
 	messages := []modelmgr.ChatMessage{
 		{Role: "system", Content: system},
