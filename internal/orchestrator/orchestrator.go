@@ -37,6 +37,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -188,6 +189,21 @@ type Config struct {
 	// as a Pensive atom and replaced with a stub in RO's conversation. Zero
 	// = use default. Negative = disable compaction.
 	CompactThresholdBytes int
+	// MaxLLMCall is the per-Complete() wall-clock deadline. Zero (the
+	// default) preserves the previous behavior: NO cap, the run's own
+	// budget is the only ceiling. Set to a positive duration to
+	// auto-cancel a single Complete() that hangs, so a wedged
+	// llama-server is distinguishable from a slow one.
+	//
+	// IMPORTANT: reasoning models (gemma-4-31B-Opus-Reasoning-Distilled,
+	// qwen3.5-27b-claude-distill at --reasoning on) can legitimately
+	// take 10+ minutes per turn when the reasoning budget fills.
+	// Setting MaxLLMCall < the worst-case reasoning-turn duration will
+	// abort healthy runs. Default to zero (off) and only opt in when
+	// you have a recovery strategy for hung children. The 7900 XTX +
+	// llama-cpp-turboquant doesn't currently surface "wedged" as a
+	// discrete state -- detection is wall-clock-only.
+	MaxLLMCall time.Duration
 	// Legacy fields (deprecated; the new RO loop does not use them, but the
 	// daemon may still set them and we accept the values silently to avoid
 	// breaking callers).
@@ -249,6 +265,24 @@ func (o *Orchestrator) setLastVerdict(v string) {
 	o.lastVerdictAt = time.Now()
 }
 
+// runState holds per-task state shared between the run goroutine
+// (which owns roLoop) and the API-facing methods (Inject, Abort,
+// Inspect). Most fields are touched ONLY by the run goroutine; the
+// fields with explicit synchronization are called out below.
+//
+// LOCK ORDER (CRITICAL -- preserve to avoid deadlock):
+//
+//   1. o.mu  (Orchestrator.mu) -- guards o.running map and global
+//                                  daemon-lifetime context.
+//   2. st.injectMu                -- guards pendingInject; the
+//                                  /tasks/<id>/inject HTTP path holds
+//                                  o.mu first to look up the task,
+//                                  then takes injectMu to enqueue.
+//
+// NEVER take o.mu while holding st.injectMu. If a future helper grows
+// a path that needs to do that, it must drop injectMu first or risk
+// deadlocking against Inject. The run goroutine reads pendingInject
+// under injectMu only -- no reverse order anywhere.
 type runState struct {
 	cancel context.CancelFunc
 	task   *taskstore.Task
@@ -501,7 +535,7 @@ func (o *Orchestrator) Submit(ctx context.Context, description, repoRoot string)
 		return nil, err
 	}
 	t.TracePath = tr.Path()
-	_ = o.cfg.Store.Save(t)
+	o.saveTaskOrLog(t, "trace path attached")
 
 	// Derive the run ctx from the orchestrator's daemon-lifetime ctx so
 	// Shutdown(timeout) cancels every in-flight task. Falls back to
@@ -728,6 +762,37 @@ func unsatisfiedAcceptanceContextForCoder(p *plan.Plan) string {
 	return b.String()
 }
 
+// saveTaskOrLog persists the task and surfaces save errors via
+// log.Printf instead of swallowing them. Disk-full / permission
+// errors during failure handling are the worst time to be invisible
+// (the operator sees "task failed" but the persisted record never
+// updated). Closes Shepherd's "Store.Save errors swallowed in
+// failure paths" finding. Control flow is unchanged; only error
+// surfacing improves.
+func (o *Orchestrator) saveTaskOrLog(t *taskstore.Task, sitenote string) {
+	if err := o.cfg.Store.Save(t); err != nil {
+		log.Printf("orchestrator: failed to persist task %s after %s: %v", t.ID, sitenote, err)
+	}
+}
+
+// completeWithDeadline wraps ModelMgr.Complete in a per-call
+// context.WithTimeout when Config.MaxLLMCall is set. Zero MaxLLMCall
+// preserves prior behavior (no cap). Returning the wrapped error
+// preserves caller-side cancellation handling; the timeout error
+// surfaces as ctx.DeadlineExceeded which the caller can distinguish
+// from a child-died error via errors.Is.
+//
+// Closes Shepherd's "no per-LLM-call deadline" finding while
+// remaining safe for reasoning models (default: no cap).
+func (o *Orchestrator) completeWithDeadline(ctx context.Context, req modelmgr.ChatRequest) (string, error) {
+	if o.cfg.MaxLLMCall <= 0 {
+		return o.cfg.ModelMgr.Complete(ctx, req)
+	}
+	cctx, cancel := context.WithTimeout(ctx, o.cfg.MaxLLMCall)
+	defer cancel()
+	return o.cfg.ModelMgr.Complete(cctx, req)
+}
+
 // isAuditStateFilePath reports whether the given path is a permitted
 // audit-mode write target. In AUDIT-ONLY mode the orchestrator allows
 // writes ONLY to the two audit state files referenced by the reviewer's
@@ -846,7 +911,7 @@ func (o *Orchestrator) run(ctx context.Context, st *runState) {
 				st.task.Status = taskstore.StatusFailed
 				st.task.LastError = msg
 				if o.cfg.Store != nil {
-					_ = o.cfg.Store.Save(st.task)
+					o.saveTaskOrLog(st.task, "ro-loop fatal")
 				}
 			}
 			if st.trace != nil {
@@ -916,7 +981,7 @@ func (o *Orchestrator) run(ctx context.Context, st *runState) {
 	// Kick off the RO loop.
 	t.Phase = taskstore.PhaseCode // closest legacy phase; RO loop unifies planning+coding
 	t.ActiveModel = "reviewer"
-	_ = o.cfg.Store.Save(t)
+	o.saveTaskOrLog(t, "ro-loop start")
 	tr.Emit(trace.KindPhase, map[string]any{"phase": "ro_loop"})
 
 	summary, ok, err := o.roLoop(ctx, st, tb)
@@ -939,7 +1004,7 @@ func (o *Orchestrator) run(ctx context.Context, st *runState) {
 
 	t.Status = taskstore.StatusSucceeded
 	t.Phase = taskstore.PhaseDone
-	_ = o.cfg.Store.Save(t)
+	o.saveTaskOrLog(t, "task succeeded")
 	tr.Emit(trace.KindDone, map[string]any{
 		"branch":  t.Branch,
 		"summary": shorten(summary, 2000),
@@ -1086,7 +1151,7 @@ func (o *Orchestrator) roLoop(ctx context.Context, st *runState, tb *toolbox.Too
 			})
 		}
 
-		resp, err := o.cfg.ModelMgr.Complete(ctx, modelmgr.ChatRequest{
+		resp, err := o.completeWithDeadline(ctx, modelmgr.ChatRequest{
 			Messages:    messages,
 			Temperature: 0.2,
 			MaxTokens:   MaxTokensReviewer,
@@ -1948,7 +2013,7 @@ func (o *Orchestrator) callPlanner(ctx context.Context, st *runState, tb *toolbo
 
 	// Short inner loop: plan text in turn 1, optional fs.write in turn 2.
 	for i := 0; i < 2; i++ {
-		resp, err := o.cfg.ModelMgr.Complete(ctx, modelmgr.ChatRequest{
+		resp, err := o.completeWithDeadline(ctx, modelmgr.ChatRequest{
 			Messages:    messages,
 			Temperature: 0.2,
 			MaxTokens:   MaxTokensPlanner,
@@ -2030,7 +2095,7 @@ func (o *Orchestrator) callCoder(ctx context.Context, st *runState, tb *toolbox.
 	}
 
 	for i := 0; i < maxTurns; i++ {
-		resp, err := o.cfg.ModelMgr.Complete(ctx, modelmgr.ChatRequest{
+		resp, err := o.completeWithDeadline(ctx, modelmgr.ChatRequest{
 			Messages:    messages,
 			Temperature: 0.1,
 			MaxTokens:   MaxTokensCoder,
@@ -2119,7 +2184,7 @@ func (o *Orchestrator) fail(st *runState, t *taskstore.Task, tr *trace.Writer, e
 	if st != nil && st.abortRequested.Load() {
 		t.Status = taskstore.StatusAborted
 		t.LastError = err.Error()
-		_ = o.cfg.Store.Save(t)
+		o.saveTaskOrLog(t, "task aborted")
 		tr.Emit(trace.KindInfo, map[string]any{"aborted_by_user": true, "reason": err.Error()})
 		o.setLastVerdict("aborted")
 		tr.Emit(trace.KindVerdict, map[string]any{
@@ -2131,7 +2196,7 @@ func (o *Orchestrator) fail(st *runState, t *taskstore.Task, tr *trace.Writer, e
 	}
 	t.Status = taskstore.StatusFailed
 	t.LastError = err.Error()
-	_ = o.cfg.Store.Save(t)
+	o.saveTaskOrLog(t, "task failed")
 	tr.Emit(trace.KindError, map[string]any{"fatal": err.Error()})
 	o.setLastVerdict("failed")
 	tr.Emit(trace.KindVerdict, map[string]any{
