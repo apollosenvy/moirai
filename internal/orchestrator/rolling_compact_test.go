@@ -20,6 +20,71 @@ func makeAskCoderResultMsg(resultID, fileName string, prosePadding int) modelmgr
 	}
 }
 
+// TestRollingWindowFitsRematch17 pins rollingWindowAskCoder=4 against the
+// historical rematch #17 ctx-overflow shape. The reviewer hit the 32K
+// context wall at turn 19 with 17 accumulated ask_coder results. With
+// rolling-window compaction at the current value, the same 17-message
+// trajectory must compact under a generous 32K * 80% headroom budget --
+// otherwise the cap is too high (window too large -> compaction is
+// insufficient) and we'll repeat rematch #17.
+//
+// Test setup mirrors the observed rematch #17 sizes: each ask_coder
+// result was on the order of 2KB (a few hundred bytes of AUTO-COMMITTED
+// header + ~1.5KB of code prose padding). 17 of them at full size sum
+// to ~34KB -- WELL over the 32K reviewer ctx. Compaction must reduce
+// this to fit a healthy headroom for the prompt + checklist + tools.
+func TestRollingWindowFitsRematch17(t *testing.T) {
+	const (
+		rematch17AskCoderCount = 17    // observed in trace
+		rematch17AskCoderBytes = 2048  // mean per-result size
+		ctxBudgetReviewer      = 32768 // gemma-4 / qwen reviewer ctx
+		// 80% of ctx leaves room for the system prompt (~6KB), the
+		// checklist (~4KB), tool envelope, and ongoing prose. The
+		// ask_coder block alone shouldn't claim more than this.
+		askCoderBudget = ctxBudgetReviewer * 80 / 100
+	)
+
+	// Build 17 ask_coder result messages. The padding count maps
+	// roughly to historical sizes (~16 bytes per padding line + ~200
+	// header bytes -> ~2KB total).
+	var messages []modelmgr.ChatMessage
+	for i := 0; i < rematch17AskCoderCount; i++ {
+		// 110 padding lines @ ~16 bytes each ~= 1760 bytes plus header
+		messages = append(messages, makeAskCoderResultMsg(
+			fmt.Sprintf("r%d", i),
+			fmt.Sprintf("apps/web/src/component%d.ts", i),
+			110,
+		))
+	}
+
+	// Pre-compaction sanity: the historical shape DOES exceed the budget.
+	preTotal := 0
+	for _, m := range messages {
+		preTotal += len(m.Content)
+	}
+	if preTotal < ctxBudgetReviewer {
+		t.Skipf("synthetic ask_coder messages too small (%d) to reproduce rematch #17 -- bump the padding constant", preTotal)
+	}
+	t.Logf("pre-compaction total: %d bytes (%.0f%% of %d ctx)",
+		preTotal, 100.0*float64(preTotal)/ctxBudgetReviewer, ctxBudgetReviewer)
+
+	reclaimed := compactStaleAskCoderResults(messages, rollingWindowAskCoder)
+	if reclaimed <= 0 {
+		t.Fatalf("compactor reclaimed 0 bytes from %d ask_coder messages -- regression on rollingWindowAskCoder",
+			rematch17AskCoderCount)
+	}
+
+	postTotal := preTotal - reclaimed
+	t.Logf("post-compaction total: %d bytes (%.0f%% of %d ctx); reclaimed %d",
+		postTotal, 100.0*float64(postTotal)/ctxBudgetReviewer, ctxBudgetReviewer, reclaimed)
+
+	if postTotal > askCoderBudget {
+		t.Errorf("post-compaction ask_coder total (%d) exceeds budget (%d, 80%% of %d ctx). "+
+			"rollingWindowAskCoder=%d is too large -- this trajectory will reproduce rematch #17",
+			postTotal, askCoderBudget, ctxBudgetReviewer, rollingWindowAskCoder)
+	}
+}
+
 func TestCompactStaleAskCoderResults_NoOpUnderWindow(t *testing.T) {
 	// 3 ask_coder results, window of 4. None should be touched.
 	messages := []modelmgr.ChatMessage{

@@ -93,20 +93,29 @@ const (
 	// caller that still references it.
 	MaxTokensAll = 24576
 
-	// Per-role max_tokens caps. The reviewer's job each turn is to
-	// emit a short prose preamble plus one <TOOL>...</TOOL> block.
-	// 4K balances "force concise turns" with "leave enough headroom
-	// to actually finish emitting the tool call." Rematch #6 with
-	// the global 24K cap had reviewer turns running ~10 minutes;
-	// rematch #7 at 2K saw the reviewer get cut off mid-tool-call
-	// (5 no_tool_call nudges in 19 LLM calls). 4K threads the
-	// needle: long-context decode at gemma-4-26B's ~30 tok/s gives
-	// roughly 2 minutes per turn, and the tool-call envelope plus
-	// args fit comfortably.
+	// Per-role max_tokens caps.
 	//
-	// The planner emits structured plans that occasionally need
-	// more room; 8K is a comfortable budget. The coder emits multi-
-	// file code blocks that legitimately fill the high cap.
+	// CALIBRATED FOR: gemma-4-26b-a4b at IQ4_XS / 32K ctx (reviewer),
+	// qwen3.5-27b-claude-distill at Q4_K_M / 128K ctx (planner),
+	// qwen3-coder-30b-a3b at IQ4_NL / 32K ctx (coder).
+	// Re-tune when swapping any role to a different model class.
+	// Specifically: gemma-4-31B-Claude-Opus-Reasoning-Distilled (the
+	// post-2026-04-26 reviewer candidate) is denser and slower per
+	// token; reviewer turns may run longer or starve at 4K.
+	//
+	// Reviewer: 4K balances "force concise turns" with "leave enough
+	// headroom to finish emitting the tool call." Rematch #6 with the
+	// global 24K cap had reviewer turns running ~10 minutes; rematch
+	// #7 at 2K cut off mid-tool-call (5 no_tool_call nudges in 19
+	// LLM calls). 4K threads the needle: long-context decode at
+	// gemma-4-26B's ~30 tok/s gives roughly 2 minutes per turn, with
+	// the <TOOL> envelope plus args fitting comfortably.
+	//
+	// Planner: 8K is comfortable; structured plans for medium tasks
+	// land around 4-6K.
+	//
+	// Coder: 24K legitimately fills with multi-file code blocks for
+	// scaffold phases.
 	MaxTokensReviewer = 4096
 	MaxTokensPlanner  = 8192
 	MaxTokensCoder    = 24576
@@ -137,13 +146,22 @@ const (
 	// blocks we keep verbatim in the reviewer's message history. Older
 	// ask_coder results get summarized down to a one-line stub preserving
 	// the AUTO-COMMITTED file list (which is the only piece the reviewer
-	// usually needs from a 5-turn-old coder reply). Calibrated from
-	// rematch #17 (2026-04-26): the reviewer hit the 32K ctx wall at turn
-	// 19 with 17 accumulated ask_coder results -- if we had kept only the
-	// most recent 4 in full and stubbed the rest, the request would have
-	// fit. 4 is small enough to reclaim ~10-25KB across a long task and
-	// large enough to preserve the immediate reasoning trail the reviewer
-	// actually re-reads.
+	// usually needs from a 5-turn-old coder reply).
+	//
+	// CALIBRATED FOR: 32K-ctx reviewer (the gemma-4-26b/31b reviewers we
+	// run). Smaller windows force more aggressive compaction; larger
+	// windows preserve more reasoning trail at the cost of context. Pin
+	// the historical regression with TestRollingWindowFitsRematch17 in
+	// rolling_compact_test.go: 17 synthetic ask_coder results at the
+	// observed sizes from rematch #17 must compact under the 32K cap
+	// when window=4. Re-tune ONLY by also re-running that test.
+	//
+	// Calibrated from rematch #17 (2026-04-26): the reviewer hit the
+	// 32K ctx wall at turn 19 with 17 accumulated ask_coder results --
+	// if we had kept only the most recent 4 in full and stubbed the
+	// rest, the request would have fit. 4 is small enough to reclaim
+	// ~10-25KB across a long task and large enough to preserve the
+	// immediate reasoning trail the reviewer actually re-reads.
 	rollingWindowAskCoder = 4
 )
 
@@ -637,6 +655,12 @@ const (
 	// duplicates. 3 means: try, retry, retry, then refuse. Lower would be
 	// brittle (a quick rewrite-then-rewrite-correctly is normal); higher
 	// wastes turns the way rematch #3 did.
+	//
+	// CALIBRATED FOR: gemma-4-26b reviewer at IQ4_XS (the model that
+	// observed the 23-turn loop). Stronger reviewers may need a lower
+	// cap; weaker ones may need higher to avoid premature rejection.
+	// Pinned by TestFsWriteRepeatCapStopsRematch3Loop in
+	// loop_detect_test.go.
 	fsWriteRepeatCap = 3
 
 	// consecutiveFsWriteSoftCap is the threshold for the "you've written
