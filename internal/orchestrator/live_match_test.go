@@ -236,6 +236,75 @@ func TestAutoExtractAndCommitCapsReplyFileCount(t *testing.T) {
 	}
 }
 
+// TestAutoExtractAndCommitRefusesInAuditMode verifies the AUDIT-ONLY
+// MODE orchestrator-side gate: even if the coder violates the prompt
+// rule and emits "# file:" markers, the orchestrator MUST NOT write
+// them to disk. The prompt rule "do NOT include # file:" is a soft
+// defense; this gate is the hard one. Same shape as P3-CRIT-1 (the
+// rolling-compact false-positive on fs.read content) -- a prompt-only
+// rule the orchestrator was trusting that the model could violate.
+func TestAutoExtractAndCommitRefusesInAuditMode(t *testing.T) {
+	repoRoot := t.TempDir()
+	tb, err := toolbox.New(repoRoot, "test-branch", t.TempDir(), repoconfig.Config{}, false)
+	if err != nil {
+		t.Fatalf("toolbox.New: %v", err)
+	}
+	t.Setenv("HOME", t.TempDir())
+	tw, _ := trace.Open("test-audit-gate")
+	defer tw.Close()
+
+	st := &runState{
+		task:      &taskstore.Task{ID: "test-audit-gate", RepoRoot: repoRoot},
+		trace:     tw,
+		auditMode: true,
+	}
+
+	// Coder emitted a fence with a file marker despite the prompt rule.
+	reply := "Findings:\n\n```go\n# file: ohno/poison.go\npackage poison\n```\n"
+	summary := autoExtractAndCommit(tb, reply, st)
+
+	// Summary must be empty (no AUTO-COMMITTED line).
+	if summary != "" {
+		t.Errorf("audit mode should refuse extraction; got summary: %q", summary)
+	}
+	// File must NOT exist on disk.
+	if _, err := os.Stat(filepath.Join(repoRoot, "ohno/poison.go")); err == nil {
+		t.Error("audit mode wrote a file despite the gate -- the audit just poisoned the audited codebase")
+	}
+	// Trace MUST emit audit_extract_blocked so an operator can see WHY.
+	tw.Close()
+	traceData, _ := os.ReadFile(tw.Path())
+	if !strings.Contains(string(traceData), "audit_extract_blocked") {
+		t.Errorf("trace missing audit_extract_blocked event: %s", traceData)
+	}
+}
+
+// TestIsAuditStateFilePath pins which paths the audit-mode fs.write
+// gate accepts. Only the two state files referenced by the AUDIT-ONLY
+// MODE prompt may be written; everything else gets refused.
+func TestIsAuditStateFilePath(t *testing.T) {
+	for _, ok := range []string{
+		".agent-router/checklist.md",
+		".agent-router/findings.md",
+		"./.agent-router/checklist.md",
+	} {
+		if !isAuditStateFilePath(ok) {
+			t.Errorf("expected %q to be allowed", ok)
+		}
+	}
+	for _, blocked := range []string{
+		".agent-router/random.md",
+		"src/main.go",
+		"/.agent-router/checklist.md",
+		".agent-router/sub/checklist.md",
+		"checklist.md",
+	} {
+		if isAuditStateFilePath(blocked) {
+			t.Errorf("expected %q to be REFUSED", blocked)
+		}
+	}
+}
+
 // TestAutoExtractAndCommitWithoutPlanIsSafe verifies that autoExtractAndCommit
 // works (writes files, returns summary) even when st.plan is nil. Pre-fix,
 // the trace emit guard was `st != nil` but blindly indirected through

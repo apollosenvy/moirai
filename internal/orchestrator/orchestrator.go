@@ -299,6 +299,15 @@ type runState struct {
 	// nil if the planner has not (yet) emitted parseable JSON.
 	plan *plan.Plan
 
+	// auditMode is true when the task description starts with the
+	// "AUDIT-ONLY:" prefix. The reviewer system prompt is conditionally
+	// expanded with the AUDIT-ONLY MODE block, AND the orchestrator
+	// disables autoExtractAndCommit so a coder reply that emits "# file:"
+	// markers (despite the prompt rule) cannot poison the audited
+	// codebase. Same shape as P3-CRIT-1: prompt rules are a soft
+	// defense; orchestrator enforcement is the hard one.
+	auditMode bool
+
 	// lastChecklistRendered is the most recent <CHECKLIST> block we
 	// injected. Used to suppress duplicate injections turn-over-turn
 	// when nothing has changed.
@@ -670,6 +679,26 @@ const (
 	consecutiveFsWriteSoftCap = 5
 )
 
+// isAuditStateFilePath reports whether the given path is a permitted
+// audit-mode write target. In AUDIT-ONLY mode the orchestrator allows
+// writes ONLY to the two audit state files referenced by the reviewer's
+// AUDIT-ONLY MODE prompt -- everything else is refused so the audited
+// codebase stays untouched.
+//
+// We strip "./" and accept either the bare path or the variants the
+// model might emit. Path matching is conservative: the file must be
+// EXACTLY one of the two allow-listed names (no subdirectories, no
+// alternate basenames). The audit dir lives at the repo root.
+//
+// TODO(rename): both allow-listed paths still reference .agent-router/
+// pending the deferred filesystem-rename. When the dir migrates to
+// .moirai/, update both branches AND the prompt strings together so
+// the prompt and the gate stay synchronized.
+func isAuditStateFilePath(path string) bool {
+	p := strings.TrimPrefix(strings.TrimSpace(path), "./")
+	return p == ".agent-router/checklist.md" || p == ".agent-router/findings.md"
+}
+
 // contentHash is FNV-1a 64-bit. We are not collision-resistant against
 // adversaries here; the hash is only used to detect "did the model emit
 // the EXACT same content twice" and a 64-bit hash is plenty.
@@ -901,10 +930,13 @@ func (o *Orchestrator) roLoop(ctx context.Context, st *runState, tb *toolbox.Too
 	// Conditionally render the AUDIT-ONLY MODE block ONLY when the task
 	// description begins with the "AUDIT-ONLY:" prefix. Default reviews
 	// burn ~70 lines of context on rules that don't apply, and Gemini's
-	// AAR pointed out the lost-in-the-middle risk. Closes that finding.
-	auditMode := strings.HasPrefix(t.Description, "AUDIT-ONLY:")
+	// AAR pointed out the lost-in-the-middle risk. Stash the flag on
+	// runState so autoExtractAndCommit can refuse to write code into
+	// the audited project (the prompt rule "do NOT include # file:"
+	// is a soft defense; orchestrator enforcement is the hard one).
+	st.auditMode = strings.HasPrefix(t.Description, "AUDIT-ONLY:")
 	messages := []modelmgr.ChatMessage{
-		{Role: "system", Content: roSystemPrompt(auditMode)},
+		{Role: "system", Content: roSystemPrompt(st.auditMode)},
 		{Role: "user", Content: "Task:\nWrite a hello-world script.\n\nRepo root: /tmp/example\nBranch: example/demo\n\nBegin. Think about what to do first, then emit a single tool call wrapped in <TOOL>...</TOOL>."},
 		{Role: "assistant", Content: `Hello-world is small enough that I can dispatch the coder directly without a planner round. I will instruct the coder to produce a single Python script.
 
@@ -1577,6 +1609,16 @@ func (o *Orchestrator) executeROTool(ctx context.Context, st *runState, tb *tool
 		}
 		content := argStr("content")
 		path := argStr("path")
+		// AUDIT-ONLY MODE gate: only the audit state files
+		// (.agent-router/checklist.md, .agent-router/findings.md) may
+		// be written -- the audited codebase MUST stay untouched.
+		// The prompt rule "fs.write only for .agent-router/..." is a
+		// soft defense; this is the orchestrator's hard one.
+		// TODO(rename): the path strings still reference .agent-router/
+		// pending the deferred filesystem-rename work.
+		if st.auditMode && !isAuditStateFilePath(path) {
+			return "", fmt.Errorf("fs.write: in AUDIT-ONLY mode, only .agent-router/checklist.md and .agent-router/findings.md may be written (refused write to %q)", path)
+		}
 		// Cap individual writes at fsWriteMaxBytes. Larger writes are
 		// almost certainly a hallucinated "let me dump the entire codebase
 		// into one file" mistake; let the model recover via a useful error
@@ -3172,6 +3214,24 @@ func validExtractionPath(path string) bool {
 const maxFilesPerCoderReply = 64
 
 func autoExtractAndCommit(tb *toolbox.Toolbox, reply string, st *runState) string {
+	// AUDIT-ONLY MODE gate: in audit mode the orchestrator MUST NOT
+	// write coder-emitted "# file:" markers into the audited codebase.
+	// The reviewer prompt asks the coder for plain-text findings, but
+	// a model that violates the rule and emits a fence anyway would
+	// otherwise have its output committed to disk. Same shape as
+	// P3-CRIT-1 (rolling-compact false-positive on fs.read content):
+	// prompt rules are a soft defense; orchestrator enforcement is hard.
+	if st != nil && st.auditMode {
+		// Surface the gate to the trace so an audit replay can
+		// diagnose "why didn't the file appear" without confusion.
+		if files := extractFileBlocks(reply); len(files) > 0 && st.trace != nil {
+			st.trace.Emit(trace.KindInfo, map[string]any{
+				"audit_extract_blocked": true,
+				"would_have_written":    len(files),
+			})
+		}
+		return ""
+	}
 	files := extractFileBlocks(reply)
 	if len(files) == 0 {
 		return ""
