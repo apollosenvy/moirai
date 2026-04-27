@@ -415,6 +415,50 @@ func TestExtractFileBlocksFromOpenAIToolCallJSON(t *testing.T) {
 	}
 }
 
+// TestExtractFromOpenAIToolCallJSONRejectsTutorialDocs pins the
+// orchestrator's defense against tutorial / documentation fence bodies
+// that LOOK like an fs.write tool call but actually have a different
+// `name` (e.g. an MCP tutorial showing what a custom function call
+// looks like). The wrapped-form gate rejects when w.Name is set and
+// != "fs.write", but a regression that drops the gate would silently
+// extract these as files. Pin the contract so a future contributor
+// "simplifying" the gate gets a clear test failure.
+//
+// (Caught during ULTRATHINK design review -- Shepherd's audit
+// surfaced the concern; the orchestrator already had the gate, but
+// no test was pinning it.)
+func TestExtractFromOpenAIToolCallJSONRejectsTutorialDocs(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "tutorial: arbitrary function name",
+			body: `{"name":"myFunction","arguments":{"path":"examples/foo.py","content":"# example\n"}}`,
+		},
+		{
+			name: "MCP-style: custom tool name",
+			body: `{"name":"document_create","arguments":{"path":"docs/spec.md","content":"# Spec"}}`,
+		},
+		{
+			name: "OpenAI tool-call but for fs.read (read, not write)",
+			body: `{"name":"fs.read","arguments":{"path":"src/foo.py","content":"unused"}}`,
+		},
+		{
+			name: "nested function shape, wrong name",
+			body: `{"function":{"name":"deploy","arguments":{"path":"k8s/manifest.yaml","content":"..."}}}`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, ok := extractFromOpenAIToolCallJSON(tc.body)
+			if ok {
+				t.Errorf("expected REFUSAL for tutorial-style JSON with name != fs.write; got accepted: %s", tc.body)
+			}
+		})
+	}
+}
+
 // TestExtractFileBlocksFallsBackToOpenAIJSON: when a fence has NO
 // `# file:` marker but DOES contain a recognizable OpenAI-style
 // fs.write JSON, the extractor returns the JSON-derived file.
