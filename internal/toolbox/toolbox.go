@@ -473,5 +473,12 @@ func (t *Toolbox) shellRun(ctx context.Context, cmdLine string) (*ExecResult, er
 		ScratchDir:   t.ScratchDir,
 		AllowNetwork: t.AllowNetwork,
 	}
-	return sandbox.Exec(ctx, pol, []string{"sh", "-c", cmdLine})
+	// Use bash, not sh: heredoc semantics, [[ ]] tests, process substitution
+	// and arrays are part of the command surface we expose to the model under
+	// the bash-only tool design. /bin/sh on most modern hosts is dash, which
+	// silently misparses several of those constructs. The bwrap policy still
+	// owns confinement; the choice of shell is just about the language the
+	// model authors against. /bin/bash is bind-mounted into the sandbox via
+	// the /bin and /usr ro-binds.
+	return sandbox.Exec(ctx, pol, []string{"bash", "-c", cmdLine})
 }

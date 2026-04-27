@@ -137,3 +137,85 @@ func TestExecRejectsEmptyArgv(t *testing.T) {
 		t.Errorf("expected empty-argv message, got %v", err)
 	}
 }
+
+// TestOutputCapTruncatesLargeStdout pins the bash-tool context-protection
+// invariant: a command emitting more than OutputCap bytes on stdout MUST
+// have Result.Truncated=true and the captured stdout MUST carry a
+// "[truncated N bytes]" tail. Without this guard a single `cat large_file`
+// from the LLM-driven coder blows past the reviewer's 32K context window
+// in one turn (the v2 ctx-overflow failure mode).
+func TestOutputCapTruncatesLargeStdout(t *testing.T) {
+	if _, err := exec.LookPath("bwrap"); err != nil {
+		t.Skip("bwrap not installed")
+	}
+	pol := Policy{
+		RepoRoot:  t.TempDir(),
+		OutputCap: 1024, // small cap so the test doesn't have to emit MB
+	}
+	// `yes` produces unbounded output; pipe through head -c to bound the
+	// total volume so the test terminates quickly. We ask for 8x the cap
+	// so truncation is unambiguous.
+	res, err := Exec(context.Background(), pol, []string{"sh", "-c", "yes XXXXXXXXX | head -c 8192"})
+	if err != nil {
+		t.Fatalf("Exec: %v", err)
+	}
+	if !res.Truncated {
+		t.Errorf("expected Truncated=true, got false (stdout len=%d)", len(res.Stdout))
+	}
+	if !strings.Contains(res.Stdout, "[truncated") {
+		t.Errorf("expected truncation tail marker in stdout, got %q", res.Stdout)
+	}
+	// The captured Stdout should be <= cap + a small marker overhead.
+	if len(res.Stdout) > pol.OutputCap+128 {
+		t.Errorf("captured stdout exceeds cap+marker: len=%d cap=%d", len(res.Stdout), pol.OutputCap)
+	}
+}
+
+// TestOutputCapNotTruncatedForSmallOutput pins the negative side: a command
+// producing well under the cap MUST NOT set Truncated, and MUST NOT carry a
+// spurious truncation marker. Catches accidental marker-injection regressions.
+func TestOutputCapNotTruncatedForSmallOutput(t *testing.T) {
+	if _, err := exec.LookPath("bwrap"); err != nil {
+		t.Skip("bwrap not installed")
+	}
+	pol := Policy{
+		RepoRoot:  t.TempDir(),
+		OutputCap: 1024,
+	}
+	res, err := Exec(context.Background(), pol, []string{"sh", "-c", "echo hello"})
+	if err != nil {
+		t.Fatalf("Exec: %v", err)
+	}
+	if res.Truncated {
+		t.Errorf("expected Truncated=false for tiny output, got true")
+	}
+	if strings.Contains(res.Stdout, "[truncated") {
+		t.Errorf("did not expect truncation marker in small output: %q", res.Stdout)
+	}
+	if !strings.Contains(res.Stdout, "hello") {
+		t.Errorf("expected 'hello' in stdout, got %q", res.Stdout)
+	}
+}
+
+// TestOutputCapDefaultApplied pins the default-cap behavior: a Policy with
+// OutputCap=0 MUST get the package default, not unbounded capture. This
+// matters because every existing call site passes Policy literals without
+// OutputCap; if we accidentally treated 0 as unbounded the cap would be
+// silently disabled in production.
+func TestOutputCapDefaultApplied(t *testing.T) {
+	if _, err := exec.LookPath("bwrap"); err != nil {
+		t.Skip("bwrap not installed")
+	}
+	pol := Policy{
+		RepoRoot: t.TempDir(),
+		// OutputCap left zero -- expect default 8 KiB.
+	}
+	// Emit ~16 KiB so we cleanly exceed the 8 KiB default.
+	res, err := Exec(context.Background(), pol, []string{"sh", "-c", "yes ABCDE | head -c 16384"})
+	if err != nil {
+		t.Fatalf("Exec: %v", err)
+	}
+	if !res.Truncated {
+		t.Errorf("expected Truncated=true with default cap and 16 KiB output, got false")
+	}
+}

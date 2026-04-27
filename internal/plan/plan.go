@@ -18,6 +18,8 @@ package plan
 import (
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 )
@@ -132,6 +134,25 @@ func Parse(reply string) (*Plan, error) {
 	// pass-1 ADV-13. We keep the FIRST occurrence and drop subsequent
 	// duplicates -- the planner's first listing is presumed canonical.
 	seenAccID := make(map[string]bool, len(p.Acceptance))
+	// Track verify strings so we can reject duplicates: a planner emitting
+	// two items with verify="bash:go test ./...:pass" lets one passing
+	// invocation tick BOTH at once, the v2 verify-vocabulary inflation
+	// finding. The bash:<exact cmd>:pass shape forces per-item granularity
+	// in language; this filter forces it in code. Same logic for legacy
+	// shapes (test.run:pass, compile.run:pass): if two items share the
+	// same verify, only the first survives. The model gets feedback via
+	// the parse error if EVERY item collapses, or via fewer-than-emitted
+	// acceptance items if just some did -- the renderChecklist progress
+	// counter will surface the discrepancy.
+	//
+	// "file:<path>" verify shapes are NOT deduped because two acceptance
+	// items legitimately may both reference the same file (one for
+	// presence, one for content shape -- the second would carry a
+	// different verify shape, but if a planner emits two file:foo.go
+	// items, that's a typo we accept silently rather than rejecting the
+	// whole plan; the suffix-uniqueness matcher and the user-facing
+	// checklist render absorb the redundancy).
+	seenVerify := make(map[string]bool, len(p.Acceptance))
 	filteredAcc := p.Acceptance[:0]
 	for _, a := range p.Acceptance {
 		if !validAcceptanceVerify(a.Verify) {
@@ -140,9 +161,15 @@ func Parse(reply string) (*Plan, error) {
 		if a.ID != "" && seenAccID[a.ID] {
 			continue
 		}
+		if !strings.HasPrefix(a.Verify, "file:") && seenVerify[a.Verify] {
+			// Drop the duplicate: the FIRST occurrence wins, the
+			// planner's later listing is presumed redundant.
+			continue
+		}
 		if a.ID != "" {
 			seenAccID[a.ID] = true
 		}
+		seenVerify[a.Verify] = true
 		filteredAcc = append(filteredAcc, a)
 	}
 	p.Acceptance = filteredAcc
@@ -218,6 +245,45 @@ func validPlanPath(path string) bool {
 func validAcceptanceVerify(verify string) bool {
 	if strings.HasPrefix(verify, "file:") {
 		return validPlanPath(strings.TrimPrefix(verify, "file:"))
+	}
+	// bash:<command>:pass -- ticks when the orchestrator's bash dispatcher
+	// records an exit-0 invocation with that exact command string. The
+	// "command" payload is intentionally NOT path-validated: it can contain
+	// arbitrary shell (e.g. `go test ./internal/foo/...` or `cd web && pnpm
+	// test --run`) and the only contract is "the exact bytes the planner
+	// wrote here must match the exact bytes the bash tool executed." This
+	// is stricter than test.run:pass / compile.run:pass: there it was
+	// "any test passed", which let the planner inflate one passing run
+	// across many acceptance items (the v2 verify-vocabulary inflation
+	// finding). The bash shape forces per-item granularity.
+	if strings.HasPrefix(verify, "bash:") && strings.HasSuffix(verify, ":pass") {
+		// At minimum the payload between the prefix and suffix must be
+		// non-empty. Reject `bash::pass` (zero-length command) so a planner
+		// typo doesn't install an item that pseudo-ticks on every empty
+		// invocation.
+		body := strings.TrimSuffix(strings.TrimPrefix(verify, "bash:"), ":pass")
+		if strings.TrimSpace(body) == "" {
+			return false
+		}
+		// Reject `:` (the bash null op): it always returns exit 0, so an
+		// item using it pseudo-ticks the moment any bash call lands. The
+		// planner likely meant a real command.
+		if strings.TrimSpace(body) == ":" {
+			return false
+		}
+		// Reject the degenerate case where TrimSuffix didn't actually
+		// match -- when verify is `bash:pass`, TrimPrefix gives `pass`
+		// and TrimSuffix(`:pass`) is a no-op (no leading colon), so body
+		// becomes `pass`. That technically passes the non-empty check but
+		// represents a planner who wrote the literal token `pass` thinking
+		// it meant the suffix marker. Detect by reconstructing and
+		// requiring at least one real internal `:` separator: a real
+		// `bash:<cmd>:pass` always has TWO colons, so verify must have
+		// at least 2.
+		if strings.Count(verify, ":") < 2 {
+			return false
+		}
+		return true
 	}
 	switch verify {
 	case "test.run:pass", "compile.run:pass":
@@ -412,6 +478,75 @@ func pathSegmentSuffix(a, b string) bool {
 		}
 	}
 	return true
+}
+
+// MarkFilesPresent ticks every plan file (and every "file:<path>" acceptance
+// item) whose target path now exists on disk under repoRoot. Returns the
+// number of newly-satisfied items.
+//
+// This is the bash-only-mode counterpart to MarkFileWritten: in legacy mode
+// fs.write tells us exactly which path was just touched, so MarkFileWritten
+// is path-driven. In bash-only mode the model writes via heredoc inside a
+// single bash invocation that may touch any number of paths; we don't know
+// which without parsing the command. So we scan the plan's declared files
+// after every successful bash invocation and tick whatever's present.
+//
+// Cost: O(files) stat calls per bash invocation. With the bashCmdHistoryLen
+// cap of 64 and typical plans of ~20 files, that's ~1280 stats per worst-
+// case run -- noise compared to the LLM call cost. The repo is local,
+// stat is cached at the kernel level. Fine.
+//
+// Skips files already satisfied so we don't re-tick. Skips paths that
+// would resolve outside the repo (the planner's path is interpreted as
+// relative to repoRoot; an absolute or traversing path is silently
+// ignored here, since validPlanPath already vetted it at parse time).
+func (p *Plan) MarkFilesPresent(repoRoot string) int {
+	if p == nil || repoRoot == "" {
+		return 0
+	}
+	// Defer the os import to a tiny helper so the test for plan.Parse
+	// doesn't need a temp dir just because Parse exists in this package.
+	stat := planFileStat
+	n := 0
+	for pi := range p.Phases {
+		for fi := range p.Phases[pi].Files {
+			f := &p.Phases[pi].Files[fi]
+			if f.Satisfied {
+				continue
+			}
+			if stat(repoRoot, f.Path) {
+				f.Satisfied = true
+				n++
+			}
+		}
+	}
+	for ai := range p.Acceptance {
+		a := &p.Acceptance[ai]
+		if a.Satisfied || !strings.HasPrefix(a.Verify, "file:") {
+			continue
+		}
+		want := strings.TrimPrefix(a.Verify, "file:")
+		if stat(repoRoot, want) {
+			a.Satisfied = true
+			n++
+		}
+	}
+	return n
+}
+
+// planFileStat returns true when joining repoRoot + relPath yields an
+// existing file (not a directory). Function-valued so tests can swap in
+// a hermetic stub without touching the filesystem.
+var planFileStat = func(repoRoot, relPath string) bool {
+	if relPath == "" {
+		return false
+	}
+	full := filepath.Join(repoRoot, relPath)
+	info, err := os.Stat(full)
+	if err != nil {
+		return false
+	}
+	return !info.IsDir()
 }
 
 // MarkAcceptance ticks acceptance items whose Verify field matches verifyKey

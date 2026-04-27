@@ -7,7 +7,6 @@
 package sandbox
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -25,7 +24,25 @@ type Policy struct {
 	ExtraRO       []string // additional paths to read-only bind
 	ExtraRW       []string // additional paths to rw bind
 	Timeout       time.Duration
+	// OutputCap is the per-stream byte limit on captured stdout/stderr.
+	// 0 selects the default (defaultOutputCap). The cap matters because
+	// the sandbox is the choke-point between an LLM-controlled bash command
+	// and the orchestrator's prompt buffer: an unbounded `cat large_file`
+	// can blow past the reviewer model's context window in a single tool
+	// result. Set to a negative value to disable capping (tests only).
+	OutputCap int
 }
+
+// defaultOutputCap is 4 KiB per stream. Calibrated against the v3.2
+// Causal Canvas run, which hit ctx overflow at turn 16 with cumulative
+// bash result accumulation (16 reviewer bash calls @ 16 KiB each = 256
+// KiB of stale bash output stacking up beyond the rolling-window
+// compactor's reach). 4 KiB stdout + 4 KiB stderr = 8 KiB per call,
+// half the v2 size. Enough for failing-test output (a typical Go test
+// failure summary is 1-2 KiB) but tight enough that 16 invocations
+// fit in the reviewer's 32K context window with room for the system
+// prompt + plan + checklist + rolling ask_coder history.
+const defaultOutputCap = 4 * 1024
 
 type Result struct {
 	Stdout   string
@@ -34,6 +51,10 @@ type Result struct {
 	TimedOut bool
 	Sandbox  string // "bwrap" or "passthrough"
 	CmdLine  string
+	// Truncated is true when stdout or stderr was clipped at OutputCap.
+	// The Stdout/Stderr strings carry a "[truncated N bytes]" tail marker
+	// when this flag is set so the model sees the truncation in-band.
+	Truncated bool
 }
 
 // Exec runs argv under bwrap with the given policy. stdin is /dev/null.
@@ -44,6 +65,9 @@ func Exec(ctx context.Context, pol Policy, argv []string) (*Result, error) {
 	if pol.Timeout == 0 {
 		pol.Timeout = 5 * time.Minute
 	}
+	if pol.OutputCap == 0 {
+		pol.OutputCap = defaultOutputCap
+	}
 	runCtx, cancel := context.WithTimeout(ctx, pol.Timeout)
 	defer cancel()
 
@@ -51,6 +75,53 @@ func Exec(ctx context.Context, pol Policy, argv []string) (*Result, error) {
 		return passthrough(runCtx, pol, argv)
 	}
 	return bwrapExec(runCtx, pol, argv)
+}
+
+// cappingWriter implements io.Writer with a per-instance byte cap. Once the
+// cap is exceeded all further writes are silently dropped; total tracks the
+// real volume so the truncation tail can report how many bytes were lost.
+//
+// We accept the writer interface to plug into exec.Cmd.Stdout/Stderr cleanly.
+// Note: a process can still write more than `cap` to its pipe -- the OS pipe
+// buffer absorbs that. We only cap what the parent ingests.
+type cappingWriter struct {
+	cap   int
+	buf   []byte
+	total int
+}
+
+func newCappingWriter(cap int) *cappingWriter {
+	return &cappingWriter{cap: cap, buf: make([]byte, 0, min(cap, 4096))}
+}
+
+func (c *cappingWriter) Write(p []byte) (int, error) {
+	c.total += len(p)
+	remaining := c.cap - len(c.buf)
+	if remaining <= 0 {
+		// Already at cap; pretend we accepted the bytes so the child
+		// process doesn't get a SIGPIPE and abort early.
+		return len(p), nil
+	}
+	if len(p) <= remaining {
+		c.buf = append(c.buf, p...)
+		return len(p), nil
+	}
+	c.buf = append(c.buf, p[:remaining]...)
+	return len(p), nil
+}
+
+// String returns the captured bytes, with a "[truncated N bytes]" tail when
+// the underlying capacity was exceeded.
+func (c *cappingWriter) String() string {
+	if c.total <= c.cap {
+		return string(c.buf)
+	}
+	return string(c.buf) + fmt.Sprintf("\n... [truncated %d bytes]", c.total-c.cap)
+}
+
+// Truncated reports whether any bytes were dropped.
+func (c *cappingWriter) Truncated() bool {
+	return c.total > c.cap
 }
 
 func bwrapExec(ctx context.Context, pol Policy, argv []string) (*Result, error) {
@@ -115,16 +186,18 @@ func bwrapExec(ctx context.Context, pol Policy, argv []string) (*Result, error) 
 	bwArgs = append(bwArgs, argv...)
 
 	cmd := exec.CommandContext(ctx, "bwrap", bwArgs...)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	stdout := newCappingWriter(pol.OutputCap)
+	stderr := newCappingWriter(pol.OutputCap)
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
 
 	err := cmd.Run()
 	res := &Result{
-		Stdout:  stdout.String(),
-		Stderr:  stderr.String(),
-		Sandbox: "bwrap",
-		CmdLine: strings.Join(argv, " "),
+		Stdout:    stdout.String(),
+		Stderr:    stderr.String(),
+		Sandbox:   "bwrap",
+		CmdLine:   strings.Join(argv, " "),
+		Truncated: stdout.Truncated() || stderr.Truncated(),
 	}
 	if ctx.Err() == context.DeadlineExceeded {
 		res.TimedOut = true
@@ -145,15 +218,17 @@ func passthrough(ctx context.Context, pol Policy, argv []string) (*Result, error
 	if pol.RepoRoot != "" {
 		cmd.Dir = pol.RepoRoot
 	}
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	stdout := newCappingWriter(pol.OutputCap)
+	stderr := newCappingWriter(pol.OutputCap)
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
 	err := cmd.Run()
 	res := &Result{
-		Stdout:  stdout.String(),
-		Stderr:  stderr.String(),
-		Sandbox: "passthrough",
-		CmdLine: strings.Join(argv, " "),
+		Stdout:    stdout.String(),
+		Stderr:    stderr.String(),
+		Sandbox:   "passthrough",
+		CmdLine:   strings.Join(argv, " "),
+		Truncated: stdout.Truncated() || stderr.Truncated(),
 	}
 	if ctx.Err() == context.DeadlineExceeded {
 		res.TimedOut = true

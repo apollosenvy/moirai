@@ -735,3 +735,141 @@ func TestRenderChecklistNonEmpty(t *testing.T) {
 		t.Errorf("progress summary wrong: %q", out)
 	}
 }
+
+// TestValidAcceptanceVerifyAcceptsBashShape pins the bash-only-mode contract:
+// a verify of "bash:<exact command>:pass" parses cleanly so the planner can
+// emit per-acceptance verification commands. This is the v2 verify-vocabulary
+// inflation fix -- forces per-item granularity instead of letting one
+// `test.run:pass` tick eight acceptance items at once.
+func TestValidAcceptanceVerifyAcceptsBashShape(t *testing.T) {
+	cases := []struct {
+		verify string
+		ok     bool
+		why    string
+	}{
+		{"bash:go test ./internal/foo/...:pass", true, "scoped go test"},
+		{"bash:go build ./...:pass", true, "build all"},
+		{"bash:cd web && pnpm test --run:pass", true, "compound shell with cd"},
+		{"bash:::pass", false, "empty command between prefix and suffix"},
+		{"bash:   :pass", false, "whitespace-only command"},
+		{"bash:foo", false, "missing :pass suffix"},
+		{"bash:pass", false, "no command between prefix and suffix"},
+	}
+	for _, tc := range cases {
+		got := validAcceptanceVerify(tc.verify)
+		if got != tc.ok {
+			t.Errorf("validAcceptanceVerify(%q) = %v, want %v (%s)", tc.verify, got, tc.ok, tc.why)
+		}
+	}
+}
+
+// TestParseAcceptsBashVerifyAtPlanLevel: the parser-level integration test
+// for the bash shape. A planner reply with a bash-shaped verify must parse
+// without error and the resulting Plan must round-trip through MarkAcceptance.
+func TestParseAcceptsBashVerifyAtPlanLevel(t *testing.T) {
+	reply := "```json\n" + `{"phases":[{"id":"P1","name":"x","files":[{"path":"a.go"}]}],"acceptance":[
+		{"id":"A1","description":"unit tests pass","verify":"bash:go test ./...:pass"}
+	]}` + "\n```"
+	p, err := Parse(reply)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if p == nil {
+		t.Fatal("nil plan")
+	}
+	if got := p.MarkAcceptance("bash:go test ./...:pass"); got != 1 {
+		t.Errorf("MarkAcceptance ticked %d items, want 1", got)
+	}
+	if !p.Acceptance[0].Satisfied {
+		t.Error("A1 should be satisfied after exact-match MarkAcceptance")
+	}
+	// Negative: a different command must NOT tick A1.
+	p2, _ := Parse(reply)
+	if got := p2.MarkAcceptance("bash:go test ./internal/foo/...:pass"); got != 0 {
+		t.Errorf("subset command should not tick parent acceptance, got %d", got)
+	}
+}
+
+// TestMarkFilesPresentTicksExistingFiles pins the bash-only counterpart to
+// MarkFileWritten: after a heredoc-driven bash invocation we don't know
+// which paths were touched, so the orchestrator scans the plan and ticks
+// any whose target now exists. The fixture stub avoids touching the real
+// filesystem so the test is hermetic.
+func TestMarkFilesPresentTicksExistingFiles(t *testing.T) {
+	// Save and restore the package-level stat hook so other tests aren't
+	// affected by ours.
+	orig := planFileStat
+	defer func() { planFileStat = orig }()
+
+	present := map[string]bool{
+		"package.json":          true,
+		"backend/src/server.ts": true,
+		// "tsconfig.json" deliberately absent.
+	}
+	planFileStat = func(repoRoot, rel string) bool {
+		if repoRoot != "/fake/repo" {
+			t.Errorf("unexpected repoRoot %q", repoRoot)
+		}
+		return present[rel]
+	}
+
+	p, _ := Parse(samplePlannerReply)
+	if p == nil {
+		t.Fatal("parse")
+	}
+	n := p.MarkFilesPresent("/fake/repo")
+	if n != 2 {
+		t.Errorf("MarkFilesPresent ticked %d, want 2", n)
+	}
+	// Check the two we expected got ticked.
+	got := map[string]bool{}
+	for pi := range p.Phases {
+		for fi := range p.Phases[pi].Files {
+			f := p.Phases[pi].Files[fi]
+			got[f.Path] = f.Satisfied
+		}
+	}
+	if !got["package.json"] || !got["backend/src/server.ts"] {
+		t.Errorf("expected package.json + backend/src/server.ts ticked, got %v", got)
+	}
+	if got["tsconfig.json"] {
+		t.Error("tsconfig.json should NOT be ticked (not present)")
+	}
+	// Calling again is a no-op: already-satisfied files don't re-count.
+	if n2 := p.MarkFilesPresent("/fake/repo"); n2 != 0 {
+		t.Errorf("re-scan should tick 0 (idempotent), got %d", n2)
+	}
+}
+
+// TestMarkFilesPresentTicksFileAcceptance: the file:<path> acceptance shape
+// also ticks via the present-scan, not just the FileSpec list. Closes the
+// gap where a planner declared an acceptance like
+// "verify: file:fixtures/sample.jsonl" without listing it under a phase.
+func TestMarkFilesPresentTicksFileAcceptance(t *testing.T) {
+	orig := planFileStat
+	defer func() { planFileStat = orig }()
+	planFileStat = func(_, rel string) bool {
+		return rel == "fixtures/sample.jsonl"
+	}
+	p, _ := Parse(samplePlannerReply)
+	if p == nil {
+		t.Fatal("parse")
+	}
+	n := p.MarkFilesPresent("/repo")
+	if n < 1 {
+		t.Errorf("expected file: acceptance ticked, got %d", n)
+	}
+	// A3 is the file: acceptance in the sample plan.
+	a3Found := false
+	for _, a := range p.Acceptance {
+		if a.ID == "A3" {
+			a3Found = true
+			if !a.Satisfied {
+				t.Error("A3 (file:fixtures/sample.jsonl) should be satisfied")
+			}
+		}
+	}
+	if !a3Found {
+		t.Fatal("A3 missing from sample plan; test premise wrong")
+	}
+}

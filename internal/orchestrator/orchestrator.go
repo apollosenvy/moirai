@@ -112,13 +112,32 @@ const (
 	// gemma-4-26B's ~30 tok/s gives roughly 2 minutes per turn, with
 	// the <TOOL> envelope plus args fitting comfortably.
 	//
-	// Planner: 8K is comfortable; structured plans for medium tasks
-	// land around 4-6K.
+	// Planner: bumped to 24K for thinking-model planners (Qwen3-30B-A3B-
+	// Thinking and friends). The output budget is shared between the
+	// model's <think>...</think> reasoning trace and the plan body. With
+	// the legacy 8K cap, the planner had roughly 2-4K of reasoning room
+	// before the plan output; ambiguous tasks were getting truncated
+	// mid-think and emitting half-baked plans. Per the 2026-04-27
+	// architecture pivot the planner gets MORE reasoning room (~16K
+	// reasoning + ~8K plan output = 4x the v2 budget) without crossing
+	// the wall-clock-cost cliff that 10x produced.
+	//
+	// First v3 attempt used 32K total + reasoning-budget=40960 on the
+	// model side; the planner decoded at ~12 tok/s on the long-reasoning
+	// path (KV grows fast under turbo3 compression of thinking-mode
+	// traces) and was projected to take 50+ minutes for one turn. Past
+	// 25 min the marginal utility of more thinking flatlined; the model
+	// was just elaborating, not converging on better assumptions.
+	//
+	// 24K total + reasoning-budget=16384 on the model side gives ~8K
+	// of plan-output headroom and ~13-15 minutes of planner wall-clock.
+	// Worth it for the assumptions-surfacing benefit; not so much that
+	// the planner alone burns the run budget.
 	//
 	// Coder: 24K legitimately fills with multi-file code blocks for
 	// scaffold phases.
 	MaxTokensReviewer = 4096
-	MaxTokensPlanner  = 8192
+	MaxTokensPlanner  = 24576
 	MaxTokensCoder    = 24576
 
 	// maxPensiveSearchCalls caps how many pensive.search dispatches
@@ -204,10 +223,63 @@ type Config struct {
 	// llama-cpp-turboquant doesn't currently surface "wedged" as a
 	// discrete state -- detection is wall-clock-only.
 	MaxLLMCall time.Duration
+	// ToolSurface selects which tool set is exposed to the role models.
+	//
+	//   ""           -- legacy (default). fs.read / fs.write / fs.search /
+	//                   test.run / compile.run / ask_planner / ask_coder /
+	//                   pensive.* / done / fail. Same surface every test in
+	//                   internal/orchestrator/* pins today.
+	//
+	//   "bash-only"  -- single bash tool routed through toolbox.ShellExec
+	//                   (which goes through internal/sandbox + bwrap).
+	//                   Files are written via heredoc, tests/builds via
+	//                   the same bash invocations the planner names in
+	//                   verify shapes. ask_planner / ask_coder / done /
+	//                   fail are still honored as control-flow tools;
+	//                   the disk-touching surface collapses to bash.
+	//
+	// Selected per-orchestrator (whole daemon), not per-task: a daemon
+	// pointed at a bash-only model fleet should run all tasks in that
+	// mode so trace replays and the A/B harness can compare apples to
+	// apples. Per-task override would silently entangle the mode with
+	// the prompt history under retries.
+	ToolSurface string
+	// BashEmitMode picks how the model is allowed to invoke the bash tool
+	// when ToolSurface == "bash-only".
+	//
+	//   ""           -- "toolcall" (default): the model emits a
+	//                   <TOOL>{"name":"bash","args":{"command":"..."}}</TOOL>
+	//                   envelope, parsed by the same extractor that handles
+	//                   every other tool. Familiar shape for models trained
+	//                   on OpenAI-style tool calling.
+	//
+	//   "fenced"     -- the model emits ```bash ... ``` blocks; the
+	//                   orchestrator extracts each block in order and
+	//                   synthesizes a toolCall before dispatch. Smaller
+	//                   models often emit fenced bash more reliably than
+	//                   tool-call JSON; this mode lets us A/B which is
+	//                   actually better for our gemma/qwen-class fleet.
+	//
+	// Ignored when ToolSurface != "bash-only".
+	BashEmitMode string
 	// Legacy fields (deprecated; the new RO loop does not use them, but the
 	// daemon may still set them and we accept the values silently to avoid
 	// breaking callers).
 	MaxReplans int
+}
+
+// IsBashOnly reports whether the orchestrator is running in bash-only
+// tool-surface mode. Centralized so the prompt selectors and the dispatcher
+// agree on the predicate even if the spelling of the config value drifts.
+func (c *Config) IsBashOnly() bool {
+	return c.ToolSurface == "bash-only"
+}
+
+// BashFenced reports whether bash invocations are expected as fenced
+// ```bash blocks (vs the default <TOOL>...</TOOL> envelope). Always false
+// when ToolSurface != "bash-only".
+func (c *Config) BashFenced() bool {
+	return c.IsBashOnly() && c.BashEmitMode == "fenced"
 }
 
 type Orchestrator struct {
@@ -397,7 +469,65 @@ type runState struct {
 	// without an intervening other tool call. Used as a soft cap to
 	// force the reviewer to verify its work.
 	consecutiveFsWrites int
+
+	// bashCmdHistory is the ordered list of bash command lines invoked
+	// during this run, in the order they were dispatched. Used by the
+	// `bash:<cmd>:pass` verify-shape matcher to confirm that the planner-
+	// declared verification command actually ran with exit 0 at some
+	// point, and by the trace renderer to reconstruct what bash actually
+	// executed (the tc.Args["command"] string is also captured, but
+	// roundtripping through here gives the matcher a single source of
+	// truth that doesn't depend on tracing being on).
+	//
+	// Only populated in ToolSurface == "bash-only" runs. Bounded growth
+	// is enforced by bashCmdHistoryLen below.
+	bashCmdHistory []bashCmdRecord
+	// bashCmdPassCount is the count of bash invocations that returned
+	// exit 0. Surfaced in the done() gate diagnostic alongside
+	// testRunPassCount/compileRunPassCount so a bash-only run can prove
+	// it ran *some* verification before terminating.
+	bashCmdPassCount int
 }
+
+// bashCmdRecord captures a single bash invocation from the bash-only tool
+// surface. The orchestrator keeps a bounded ring of these so the
+// `bash:<cmd>:pass` verify-shape matcher and the done() gate can confirm
+// the planner-declared verification command actually ran with exit 0.
+//
+// ContentHash is a 64-bit FNV hash of the full command string. Used by the
+// bash-side loop detector (mirror of fsWriteHistory's hash) to refuse a
+// command that the model has already invoked verbatim N times in a row
+// without making progress -- the v3.3 cmd/root.go failure shape, where
+// Gemma rewrote the same buggy file 8 times even after operator injects
+// telling it to stop. Comparing on full-string hash (not just a path
+// prefix) is intentional: a model dispatching `cat foo.go` and then
+// `cat -n foo.go` is doing different work and shouldn't trip the
+// detector.
+type bashCmdRecord struct {
+	Command     string // the exact command string passed to bash -c
+	ContentHash uint64 // FNV-64 of Command, for loop detection
+	ExitCode    int    // 0 on success, non-zero otherwise
+}
+
+// bashRepeatCap caps how many times the SAME command (by content-hash) may
+// be dispatched consecutively before the orchestrator refuses with a
+// structured nudge. Calibrated against v3.3 Causal Canvas: Gemma rewrote
+// cmd/root.go 8 times in 14 turns, each rewrite producing the same
+// duplicate-Execute compile error. Setting the cap at 3 means the
+// reviewer gets two free retries (legitimate "fix the formatting" edits)
+// before the orchestrator forces a different action.
+//
+// Mirrors fsWriteRepeatCap. Same shape, same intent: prompt-only
+// enforcement of "don't loop" is a soft defense; orchestrator-side
+// hard refusal is the real one.
+const bashRepeatCap = 3
+
+// bashCmdHistoryLen caps the bashCmdHistory ring. 64 entries is generous
+// for any realistic task (rematch runs averaged ~20 reviewer turns; even
+// a worst-case 90-minute run rarely emits more than 50 bash invocations)
+// and keeps the runState struct's footprint bounded if a runaway loop
+// somehow slips past the higher-level loop detection.
+const bashCmdHistoryLen = 64
 
 // fsWriteRecord tracks one fs.write invocation for loop detection.
 type fsWriteRecord struct {
@@ -894,6 +1024,95 @@ func duplicateWriteCount(history []fsWriteRecord, path string, hash uint64) int 
 	return n
 }
 
+// duplicateBashCount returns how many times the given content-hash appears
+// in the recent bash invocation history. The bash dispatcher consults this
+// BEFORE running a command to decide whether to reject as a stuck-loop
+// duplicate. Mirrors duplicateWriteCount but keyed only on hash (no path
+// component): a bash invocation has no separate path field; the entire
+// command string IS the identity.
+//
+// We DELIBERATELY require an EXACT hash match, not "path-prefix" or
+// "edit-distance". A model legitimately iterating on a file should produce
+// SLIGHTLY different commands each turn (different content in the
+// heredoc body, different sed substitution, different test name).
+// Identical bytes N turns in a row is the loop signature.
+func duplicateBashCount(history []bashCmdRecord, hash uint64) int {
+	n := 0
+	for _, r := range history {
+		if r.ContentHash == hash {
+			n++
+		}
+	}
+	return n
+}
+
+// bashWriteTargetRE extracts the destination path from common shell
+// "write to file" idioms in a bash command:
+//
+//	cat > path <<EOF...EOF
+//	cat >> path
+//	echo "..." > path
+//	tee path
+//	tee -a path
+//	sed -i 's/.../.../' path
+//
+// Returns the FIRST captured path, or "" if no recognized pattern matches.
+// Multi-redirect scripts (a single bash invocation writing five files)
+// only count their first target -- correct for the common case where
+// the model is iterating on a SINGLE file across turns; a healthy
+// multi-write script is rarely repeated verbatim.
+//
+// We DELIBERATELY do not enumerate every redirection form in shell. The
+// detector is heuristic; the goal is "catch the v3.3-style same-file
+// rewrite-loop" not "perfect static analysis of bash."
+var bashWriteTargetRE = regexp.MustCompile(`(?m)(?:cat\s*>>?\s*([^\s<;|&]+)|tee\s+(?:-a\s+)?([^\s;|&]+)|sed\s+-i[^\s]*\s+(?:-e\s+)?'[^']*'\s+([^\s;|&]+))`)
+
+// extractBashWriteTarget returns the first write-target path the heuristic
+// can find in the command, or "" if none.
+func extractBashWriteTarget(cmd string) string {
+	m := bashWriteTargetRE.FindStringSubmatch(cmd)
+	if m == nil {
+		return ""
+	}
+	for _, group := range m[1:] {
+		if group != "" {
+			return group
+		}
+	}
+	return ""
+}
+
+// consecutiveBashWritesToTarget walks the bash history from the most-recent
+// end backward and returns how many CONSECUTIVE invocations all write to the
+// same target path. Stops at the first record that targets a different path
+// (or no path at all -- a `go build` or `cat foo.go` breaks the streak).
+//
+// This is the v3.4 calibration: Gemma alternated between two near-identical
+// `cat >> docs/review/REVIEW.md <<...` commands that differed only in the
+// trailing whitespace, slipping under the byte-exact duplicateBashCount
+// threshold. Tracking the WRITE TARGET (not the body) catches it.
+func consecutiveBashWritesToTarget(history []bashCmdRecord, target string) int {
+	if target == "" {
+		return 0
+	}
+	n := 0
+	for i := len(history) - 1; i >= 0; i-- {
+		t := extractBashWriteTarget(history[i].Command)
+		if t != target {
+			break
+		}
+		n++
+	}
+	return n
+}
+
+// bashSameTargetCap caps how many consecutive bash invocations may write
+// to the same file before the orchestrator forces the model to pick a
+// different action. Lower than bashRepeatCap (which is byte-exact): four
+// re-edits of the same file is "I'm iterating," seven is "I'm stuck on
+// this one file."
+const bashSameTargetCap = 4
+
 func injectQueueBytes(q []string) int {
 	n := 0
 	for _, s := range q {
@@ -1102,7 +1321,7 @@ func (o *Orchestrator) roLoop(ctx context.Context, st *runState, tb *toolbox.Too
 	// is a soft defense; orchestrator enforcement is the hard one).
 	st.auditMode = strings.HasPrefix(t.Description, "AUDIT-ONLY:")
 	messages := []modelmgr.ChatMessage{
-		{Role: "system", Content: roSystemPrompt(st.auditMode)},
+		{Role: "system", Content: o.roSystemPromptForCfg(st.auditMode)},
 		{Role: "user", Content: "Task:\nWrite a hello-world script.\n\nRepo root: /tmp/example\nBranch: example/demo\n\nBegin. Think about what to do first, then emit a single tool call wrapped in <TOOL>...</TOOL>."},
 		{Role: "assistant", Content: `Hello-world is small enough that I can dispatch the coder directly without a planner round. I will instruct the coder to produce a single Python script.
 
@@ -1219,6 +1438,26 @@ func (o *Orchestrator) roLoop(ctx context.Context, st *runState, tb *toolbox.Too
 		})
 
 		call, ok, parseErr := extractToolCallChecked(resp)
+		// Bash-only + fenced emit-mode: if the standard <TOOL> envelope
+		// parser didn't find anything but the reply contains ```bash
+		// fenced blocks, synthesize a single bash toolCall whose command
+		// is the joined fence bodies. Lets the dispatcher treat fenced
+		// and tool-call invocations identically. Only fires when both
+		// flags are set; the standard parser still wins when present so
+		// a model that emits both forms in one turn doesn't double-fire.
+		if !ok && o.cfg.BashFenced() {
+			blocks := extractBashFenceBlocks(resp)
+			if synth, sok := synthesizeBashToolCallFromFences(resp); sok {
+				call = synth
+				ok = true
+				parseErr = nil
+				tr.Emit(trace.KindInfo, map[string]any{
+					"bash_fence_synth": true,
+					"turn":             st.roTurns,
+					"fence_count":      len(blocks),
+				})
+			}
+		}
 
 		// RO-prose-bloat guard: if RO emitted no tool call AND the response is
 		// large (>8 KB), truncate it before appending to messages. Unbounded
@@ -1435,6 +1674,59 @@ func (o *Orchestrator) roLoop(ctx context.Context, st *runState, tb *toolbox.Too
 		}
 		messages = append(messages, modelmgr.ChatMessage{Role: "user", Content: payload})
 
+		// Bash-only mode terminal-state poll: after every successful bash
+		// invocation, inspect docs/review/REVIEW.md for a `## STATUS: DONE`
+		// or `## STATUS: BLOCKED: <reason>` last-line marker. This replaces
+		// the legacy done()/fail() tools in bash-only mode -- the reviewer
+		// signals completion by writing into the audit trail rather than
+		// invoking a magic tool. The acceptance gate still applies: a
+		// premature STATUS: DONE without satisfied acceptance is treated
+		// as a recoverable warning, not a terminator.
+		if o.cfg.IsBashOnly() && call.Name == "bash" && toolErr == nil {
+			kind, reason, ok := bashOnlyTerminalStatus(tb.RepoRoot)
+			if ok {
+				switch kind {
+				case "done":
+					if unmet := st.plan.UnsatisfiedAcceptance(); len(unmet) > 0 {
+						var b strings.Builder
+						b.WriteString("STATUS: DONE detected in docs/review/REVIEW.md but the plan's acceptance criteria are not all satisfied. Unsatisfied:\n")
+						for _, u := range unmet {
+							b.WriteString("  - ")
+							b.WriteString(u)
+							b.WriteString("\n")
+						}
+						b.WriteString("Run the missing bash:<cmd>:pass commands and stat the missing files; either revise REVIEW.md to remove the premature STATUS line or change it to STATUS: BLOCKED if completion is impossible.")
+						errMsg := b.String()
+						tr.Emit(trace.KindToolCall, map[string]any{
+							"kind":        "ro_status_premature",
+							"unsatisfied": len(unmet),
+							"turn":        st.roTurns,
+						})
+						messages = append(messages, modelmgr.ChatMessage{
+							Role:    "user",
+							Content: fmt.Sprintf("<ERROR>%s</ERROR>", errMsg),
+						})
+						// Do NOT terminate; let the loop continue so the
+						// reviewer can fix the situation. The STATUS line
+						// stays in REVIEW.md until the reviewer rewrites it.
+					} else {
+						tr.Emit(trace.KindToolCall, map[string]any{
+							"kind": "ro_status_done",
+							"turn": st.roTurns,
+						})
+						return "STATUS: DONE (bash-only mode terminal)", true, nil
+					}
+				case "blocked":
+					tr.Emit(trace.KindToolCall, map[string]any{
+						"kind":   "ro_status_blocked",
+						"reason": shorten(reason, 400),
+						"turn":   st.roTurns,
+					})
+					return reason, false, nil
+				}
+			}
+		}
+
 		// Rolling-window compaction of accumulated ask_coder result
 		// blocks. The most-recent rollingWindowAskCoder are kept verbatim;
 		// older ones are summarized in place. See the constant docstring
@@ -1451,6 +1743,21 @@ func (o *Orchestrator) roLoop(ctx context.Context, st *runState, tb *toolbox.Too
 				"rolling_compact": true,
 				"reclaimed_bytes": reclaimed,
 				"window":          rollingWindowAskCoder,
+				"turn":            st.roTurns,
+			})
+		}
+		// Bash-only mode: also compact stale bash results. v3.2 hit ctx
+		// overflow at turn 16 because cumulative reviewer bash invocations
+		// (16 calls @ 8-16 KiB each) stacked up faster than the ask_coder
+		// rolling window could compact them. Apply the same window
+		// discipline to bash results when they accumulate.
+		if o.cfg.IsBashOnly() && call.Name == "bash" {
+			reclaimed := compactStaleBashResults(messages, rollingWindowBash)
+			tr.Emit(trace.KindInfo, map[string]any{
+				"rolling_compact": true,
+				"target":          "bash",
+				"reclaimed_bytes": reclaimed,
+				"window":          rollingWindowBash,
 				"turn":            st.roTurns,
 			})
 		}
@@ -1479,6 +1786,80 @@ func (o *Orchestrator) roLoop(ctx context.Context, st *runState, tb *toolbox.Too
 // re-reads, and the compactor's stub would lose that prose. They tend
 // to be small anyway (auto-extract failed because the coder emitted no
 // recognizable fence), so leaving them alone is cheap.
+// compactStaleBashResults condenses old bash <RESULT>exit=N\nstdout:...\n
+// stderr:...</RESULT> blocks the same way compactStaleAskCoderResults does
+// for ask_coder. Calibrated against v3.2 Causal Canvas which hit ctx
+// overflow at turn 16 because the reviewer's accumulated `go test` /
+// `ls -R` / `cat docs/...` outputs stacked up beyond the rolling-window
+// reach. Keeps the most-recent `keep` bash results verbatim; older ones
+// shrink to "[stale bash result, N bytes, exit=X]" stubs.
+//
+// Only runs in bash-only mode (caller checks o.cfg.IsBashOnly()).
+// In legacy mode this would over-compact: legacy reviewer's bash equivalent
+// goes through fs.read / test.run / compile.run, each of which has
+// distinct semantic shape we don't want to flatten.
+func compactStaleBashResults(messages []modelmgr.ChatMessage, keep int) int {
+	if keep < 0 {
+		keep = 0
+	}
+	const bashPrefix = "<RESULT>exit="
+	var idxs []int
+	for i, m := range messages {
+		if m.Role != "user" {
+			continue
+		}
+		if strings.HasPrefix(m.Content, bashPrefix) {
+			idxs = append(idxs, i)
+		}
+	}
+	if len(idxs) <= keep {
+		return 0
+	}
+	stale := idxs[:len(idxs)-keep]
+	reclaimed := 0
+	for _, i := range stale {
+		orig := messages[i].Content
+		stub := stubFromBashResult(orig)
+		if len(stub) >= len(orig) {
+			continue
+		}
+		messages[i].Content = stub
+		reclaimed += len(orig) - len(stub)
+	}
+	return reclaimed
+}
+
+// stubFromBashResult condenses a bash <RESULT>exit=...</RESULT> message
+// into a short stub preserving the exit code (still useful evidence for
+// the reviewer's reasoning). Idempotent on already-stubbed messages.
+func stubFromBashResult(content string) string {
+	if strings.HasPrefix(content, "<RESULT>[stale bash") {
+		return content
+	}
+	originalLen := len(content)
+	// Pull the exit code from the leading "exit=N\n" line.
+	body := strings.TrimPrefix(content, "<RESULT>")
+	body = strings.TrimSuffix(body, "</RESULT>")
+	exit := "?"
+	if strings.HasPrefix(body, "exit=") {
+		// up to the first newline
+		if nl := strings.IndexByte(body, '\n'); nl > 5 {
+			exit = body[5:nl]
+		} else {
+			exit = body[5:]
+		}
+	}
+	return fmt.Sprintf("<RESULT>[stale bash result, %d bytes, exit=%s]</RESULT>",
+		originalLen, exit)
+}
+
+// rollingWindowBash is the per-tool retention count for bash results in
+// bash-only mode. Smaller than the ask_coder window because bash results
+// are individually smaller (mostly test/build output capped at 8 KiB
+// total per call) but more numerous (ls / cat / grep / build / test all
+// flow through the same tool name).
+const rollingWindowBash = 3
+
 func compactStaleAskCoderResults(messages []modelmgr.ChatMessage, keep int) int {
 	if keep < 0 {
 		keep = 0
@@ -1731,6 +2112,24 @@ func (o *Orchestrator) executeROTool(ctx context.Context, st *runState, tb *tool
 		return planText, nil
 
 	case "ask_coder":
+		// HARD GATE: in bash-only mode the reviewer MUST dispatch
+		// ask_planner BEFORE the first ask_coder. Small reviewer models
+		// (A3B-sparsity 3B-active variants like Nemotron-3-Nano-30B-A3B
+		// and GLM-Flash-REAP-23B-A3B) skip the planner step ~50% of the
+		// time despite the prompt's TURN-1-SPECIFICALLY instruction --
+		// they correctly perceive "build the project" but lose the
+		// procedural ordering rule. Without a planner-emitted JSON plan,
+		// st.plan stays nil, the checklist is empty, and acceptance
+		// gating cannot fire. Soft prompt rules cannot beat this; the
+		// orchestrator enforces.
+		//
+		// Legacy (non-bash-only) mode keeps the old behavior: planner
+		// is encouraged but not required, since the legacy reviewer
+		// prompts have ~14 months of refinement and dense-31B models
+		// follow them reliably.
+		if o.cfg.IsBashOnly() && st.askPlannerCalls == 0 {
+			return "", fmt.Errorf("ask_coder rejected: bash-only mode REQUIRES dispatching ask_planner first (Turn 1) to produce a structured plan with acceptance items. Without a plan, the orchestrator cannot tick file-presence acceptance, cannot check verify shapes, and the run cannot terminate cleanly. Re-emit your turn as <TOOL>{\"name\":\"ask_planner\",\"args\":{\"instruction\":\"...\"}}</TOOL> with the task description. After the planner emits, your NEXT turn commits docs/plans/PLAN.md + docs/review/REVIEW.md via fenced bash, THEN you can ask_coder for phase P1")
+		}
 		if st.askCoderCalls >= o.cfg.MaxCoderRetries {
 			return "", fmt.Errorf("ask_coder budget exhausted (%d)", o.cfg.MaxCoderRetries)
 		}
@@ -1754,6 +2153,41 @@ func (o *Orchestrator) executeROTool(ctx context.Context, st *runState, tb *tool
 			st.lastTestFailed = false
 		}
 		st.workOps++
+		// Bash-only mode: auto-execute the coder's fenced bash block(s).
+		// The coder's job in bash-only mode is to PRODUCE a bash heredoc
+		// script that creates the requested files; the orchestrator
+		// runs it. Without this step the reviewer would have to copy
+		// the coder's heredoc verbatim into its own bash tool call --
+		// a context-burn nightmare and a transcription-error vector
+		// (heredoc delimiter conflicts, missing escapes, etc.). The
+		// auto-execute path is the moral equivalent of legacy
+		// autoExtractAndCommit but for bash heredoc scripts.
+		if o.cfg.IsBashOnly() {
+			summary := autoExecuteCoderBash(ctx, tb, st, code)
+			if summary != "" {
+				return summary + "\n\n--- coder reply ---\n" + code, nil
+			}
+			// No fenced bash but the reply mentions `# file:` -- the coder
+			// reverted to the legacy v1 marker convention despite the
+			// bash-only prompt forbidding it. Surface this as a STRUCTURED
+			// error so the reviewer's next turn sees "the coder emitted
+			// the wrong format" instead of "the coder said something that
+			// might mean files were written." Without this defense,
+			// Qwen3-Coder's strong prior toward `# file:` markers (its
+			// dominant training format) silently drops every coder turn
+			// in bash-only mode.
+			if hasLegacyFileMarker(code) {
+				st.trace.Emit(trace.KindInfo, map[string]any{
+					"coder_legacy_marker_rejected": true,
+					"turn":                         st.roTurns,
+				})
+				return "CODER ERROR: emitted legacy `# file: <path>` markers instead of fenced ```bash heredoc script. Bash-only mode requires bash fences. Re-dispatch ask_coder with explicit instruction: 'Emit ONE fenced bash block. Inside the fence use `cat > path <<\\'EOF\\' ... EOF` heredocs to write files. Do NOT use `# file:` markers.'\n\n--- coder reply (rejected) ---\n" + shorten(code, 1000), nil
+			}
+			// No fenced bash in the reply -- the coder emitted prose only.
+			// Pass the prose through; the reviewer will dispatch again
+			// (or interpret the prose as a "I need clarification").
+			return code, nil
+		}
 		// AUTO-EXTRACT-AND-COMMIT: parse `# file: <path>` markdown-fenced
 		// code blocks from the coder's reply and write them via the
 		// toolbox. Observed in rematch #5 with Qwen3-Coder-30B-A3B: the
@@ -1959,6 +2393,118 @@ func (o *Orchestrator) executeROTool(ctx context.Context, st *runState, tb *tool
 		return fmt.Sprintf("exit=%d\nstdout:\n%s\nstderr:\n%s",
 			r.ExitCode, shorten(r.Stdout, 4000), shorten(r.Stderr, 2000)), nil
 
+	case "bash":
+		// Bash-only tool surface (Config.ToolSurface == "bash-only").
+		//
+		// Single tool through which the model touches disk, runs tests,
+		// runs builds, greps for code, and writes plan/review docs.
+		// Confinement is bwrap (not the prompt). The sandbox-layer
+		// OutputCap clips multi-megabyte stdout dumps so a `cat
+		// large_file` cannot blow past the reviewer's 32K context window
+		// in a single tool result -- that was the v2 ctx-overflow shape.
+		if !o.cfg.IsBashOnly() {
+			// Defense-in-depth: legacy mode should never produce a bash
+			// tool call (the prompt doesn't mention bash), but a model
+			// that emits one anyway gets a structured error rather than
+			// silent confinement bypass via the bash tool.
+			return "", fmt.Errorf("bash: tool not available in legacy ToolSurface; use fs.write / fs.read / test.run / compile.run instead")
+		}
+		cmd := argStr("command")
+		if cmd == "" {
+			return "", fmt.Errorf("bash: command required")
+		}
+		// 8 KiB per command-line arg is more than enough for any
+		// reasonable invocation (heredoc bodies are NOT counted -- they
+		// reach bash via the single -c arg, but bash itself splits the
+		// here-document content out of the script). Reject obviously
+		// runaway payloads early.
+		if len(cmd) > 1<<15 {
+			return "", fmt.Errorf("bash: command exceeds 32 KiB cap (got %d); split into multiple invocations or write a script via heredoc and exec it", len(cmd))
+		}
+		// Loop detection: refuse the EXACT same command if it has appeared
+		// bashRepeatCap times in the recent ring. Closes the v3.3 cmd/root.go
+		// failure shape where Gemma rewrote the same buggy file 8 times in
+		// a row even after operator /inject corrections. Mirrors fs.write's
+		// duplicate-rejection logic; the structured error gives the model a
+		// concrete next-action menu so it can break out of the loop without
+		// a human nudge.
+		cmdHash := contentHash(cmd)
+		if duplicateBashCount(st.bashCmdHistory, cmdHash) >= bashRepeatCap {
+			st.trace.Emit(trace.KindToolCall, map[string]any{
+				"kind":       "bash_loop_rejected",
+				"hash":       cmdHash,
+				"cap":        bashRepeatCap,
+				"turn":       st.roTurns,
+				"cmd_prefix": shorten(cmd, 80),
+			})
+			return "", fmt.Errorf("bash: rejected duplicate command (you have run this exact command %d+ times in a row without producing different output). Stuck in a loop. Pick a different action: (a) read a different file with `cat path/to/other.go`, (b) use `grep -rn 'symbol' .` to look elsewhere in the codebase, (c) dispatch ask_coder with NEW instructions naming the EXACT change you want, or (d) append `## STATUS: BLOCKED: <reason>` to docs/review/REVIEW.md if completion is impossible. The same command will not be re-run", bashRepeatCap)
+		}
+		// v3.4 calibration: byte-exact loop-detect can be evaded by a model
+		// that emits two near-identical bash commands alternately (each one
+		// repeating only twice, just under bashRepeatCap). The path-target
+		// detector catches the semantic shape: N CONSECUTIVE writes to the
+		// same file regardless of body bytes.
+		writeTarget := extractBashWriteTarget(cmd)
+		if writeTarget != "" {
+			n := consecutiveBashWritesToTarget(st.bashCmdHistory, writeTarget)
+			if n >= bashSameTargetCap {
+				st.trace.Emit(trace.KindToolCall, map[string]any{
+					"kind":          "bash_target_loop_rejected",
+					"target":        writeTarget,
+					"streak":        n,
+					"cap":           bashSameTargetCap,
+					"turn":          st.roTurns,
+				})
+				return "", fmt.Errorf("bash: rejected -- you have written to %s %d times in a row without an intervening different action (test, build, ask_coder, or a write to a different file). The model is stuck iterating on one file. Pick a DIFFERENT action: (a) `go build ./...` or `go test ./...` to gather verification evidence, (b) ask_coder with NEW instructions naming a DIFFERENT file or component, (c) `cat <other-file>` to read elsewhere, or (d) append `## STATUS: BLOCKED: <reason>` to docs/review/REVIEW.md if the work cannot proceed. Repeat-writes to %s are temporarily refused", writeTarget, n, writeTarget)
+			}
+		}
+		r, err := tb.ShellExec(ctx, cmd)
+		if err != nil {
+			return "", err
+		}
+		// Record the invocation for the verify-shape matcher and the
+		// done() gate. ExitCode is sandbox-reported, not derived from
+		// stderr-grepping.
+		st.bashCmdHistory = append(st.bashCmdHistory, bashCmdRecord{Command: cmd, ContentHash: cmdHash, ExitCode: r.ExitCode})
+		if len(st.bashCmdHistory) > bashCmdHistoryLen {
+			st.bashCmdHistory = st.bashCmdHistory[len(st.bashCmdHistory)-bashCmdHistoryLen:]
+		}
+		if r.ExitCode == 0 {
+			st.bashCmdPassCount++
+			// Tick acceptance items with verify="bash:<exact cmd>:pass".
+			// Always emit the trace event when the plan is loaded so we
+			// can distinguish "no acceptance with that verify" (n=0)
+			// from "no bash invocation matched". Matches fs.write /
+			// test.run / compile.run diagnostic shape.
+			if st.plan != nil {
+				verifyShape := "bash:" + cmd + ":pass"
+				n := st.plan.MarkAcceptance(verifyShape)
+				st.trace.Emit(trace.KindInfo, map[string]any{
+					"checklist_ticked": n,
+					"verify":           verifyShape,
+					"source":           "bash",
+				})
+				// Also tick file:<path> acceptance for any newly-existing
+				// files in the repo. Cheap and load-bearing: a heredoc
+				// `cat > docs/plans/PLAN.md <<EOF...EOF` should tick the
+				// "file:docs/plans/PLAN.md" acceptance even though no
+				// fs.write tool call was emitted.
+				if n2 := st.plan.MarkFilesPresent(tb.RepoRoot); n2 > 0 {
+					st.trace.Emit(trace.KindInfo, map[string]any{
+						"checklist_ticked": n2,
+						"source":           "bash_file_present_scan",
+					})
+				}
+			}
+		}
+		st.workOps++
+		out := fmt.Sprintf("exit=%d\nstdout:\n%s\nstderr:\n%s",
+			r.ExitCode, shorten(r.Stdout, 4000), shorten(r.Stderr, 2000))
+		if r.Truncated {
+			out += "\n(note: output was truncated by the sandbox cap; redirect verbose commands to a file and tail it instead)"
+		}
+		return out, nil
+
 	case "pensive.search":
 		// Hard cap: reviewers tend to over-call pensive.search as a
 		// reflex (rematch #6 saw 5 calls back-to-back, rematch #7
@@ -2053,7 +2599,7 @@ func (o *Orchestrator) callPlanner(ctx context.Context, st *runState, tb *toolbo
 	}
 	tr.Emit(trace.KindSwap, map[string]any{"to": "planner", "reason": "ask_planner"})
 
-	system := plannerSystemPrompt()
+	system := o.plannerSystemPromptForCfg()
 	user := fmt.Sprintf(
 		"Task:\n%s\n\nRepo root: %s\n\nInstruction from the Reviewer-Orchestrator:\n%s\n\nProduce the plan now. When you are satisfied, optionally commit the plan by emitting <TOOL>{\"name\":\"fs.write\",\"args\":{\"path\":\"PLAN.md\",\"content\":\"...\"}}</TOOL>. Your plan text (the actual numbered steps) must be in the assistant reply itself; the Reviewer-Orchestrator reads it directly.",
 		st.task.Description, st.task.RepoRoot, instruction,
@@ -2123,7 +2669,7 @@ func (o *Orchestrator) callCoder(ctx context.Context, st *runState, tb *toolbox.
 	}
 	tr.Emit(trace.KindSwap, map[string]any{"to": "coder", "reason": "ask_coder", "retry_mode": retryMode})
 
-	system := coderSystemPrompt(retryMode)
+	system := o.coderSystemPromptForCfg(retryMode)
 	// Orchestrator-side enforcement of the reviewer prompt's
 	// GOAL-DRIVEN EXECUTION rule ("name the test that proves it"):
 	// surface the unsatisfied acceptance items the coder's work needs
@@ -2171,10 +2717,59 @@ func (o *Orchestrator) callCoder(ctx context.Context, st *runState, tb *toolbox.
 
 		// Retry mode: check for a read-only tool call; execute and loop.
 		call, ok := extractToolCall(resp)
+		// In bash-only mode the coder is told to emit fenced bash, not
+		// JSON tool envelopes. If extractToolCall didn't find an envelope
+		// but the reply contains bash fences, synthesize a bash toolCall
+		// so the retry-mode loop can execute the inspection commands the
+		// coder is iterating with (cat, grep, ls, etc.). Mirrors the
+		// reviewer-side fence synthesis in roLoop. Without this, the
+		// retry-mode coder is silently treated as having "produced its
+		// final code" the moment it emits its first fenced inspection
+		// block, defeating multi-turn retry.
+		if !ok && o.cfg.IsBashOnly() {
+			if synth, sok := synthesizeBashToolCallFromFences(resp); sok {
+				call = synth
+				ok = true
+			}
+		}
 		if !ok {
 			return resp, nil
 		}
 		switch call.Name {
+		case "bash":
+			// Bash-only retry-mode: coder uses bash readers (cat / grep / find)
+			// to inspect existing files before re-emitting code. Mirrors the
+			// reviewer's bash dispatch but the result is fed back to the
+			// SAME coder turn loop, not to the reviewer. Sandbox confinement
+			// is identical (bwrap, OutputCap, etc).
+			//
+			// Note: this case is only reachable when the coder prompt has
+			// described bash as available. The bash-only coder prompt
+			// (bash_prompts.go) does that. In legacy mode the coder doesn't
+			// know about bash and the case won't fire; the executeROTool
+			// "case bash" gate that returns "tool not available in legacy
+			// ToolSurface" still defends against accidental dispatches.
+			cmd, _ := call.Args["command"].(string)
+			if cmd == "" {
+				return resp, nil
+			}
+			r, err := tb.ShellExec(ctx, cmd)
+			payload := ""
+			if err != nil {
+				payload = fmt.Sprintf("<ERROR>%s</ERROR>", err.Error())
+			} else {
+				payload = fmt.Sprintf("<RESULT>exit=%d\nstdout:\n%s\nstderr:\n%s</RESULT>",
+					r.ExitCode, shorten(r.Stdout, 4000), shorten(r.Stderr, 1000))
+			}
+			tr.Emit(trace.KindToolCall, map[string]any{
+				"kind":  "c_tool_call",
+				"name":  "bash",
+				"cmd":   shorten(cmd, 200),
+				"bytes": len(payload),
+				"error": errString(err),
+			})
+			messages = append(messages, modelmgr.ChatMessage{Role: "user", Content: payload})
+			continue
 		case "fs.read":
 			path, _ := call.Args["path"].(string)
 			res, err := tb.FSRead(path, 1<<17)
@@ -2998,6 +3593,7 @@ func isKnownToolName(name string) bool {
 		"fs.read", "fs.write", "fs.search",
 		"test.run", "compile.run",
 		"pensive.search", "pensive.emit_atom",
+		"bash", // bash-only tool surface (Config.ToolSurface == "bash-only")
 		"done", "fail":
 		return true
 	}
@@ -3182,6 +3778,111 @@ func findFenceBlocks(reply string) []string {
 		i = bodyEnd + 1
 	}
 	return out
+}
+
+// extractBashFenceBlocks walks `reply` for fenced code blocks with a bash-
+// flavored info string ("bash", "sh", or "shell" -- case-insensitive,
+// optional surrounding whitespace) and returns each block's body in source
+// order. Used by the bash-only tool surface when Config.BashEmitMode ==
+// "fenced": small models (gemma-class) emit fenced code more reliably than
+// JSON tool calls, and the v2 trace shows the coder defaulting to fenced
+// output even when told otherwise. We meet the model where it lives.
+//
+// Multi-fence semantics: a reply containing multiple bash fences becomes a
+// SINGLE bash invocation whose command is the fence bodies joined with
+// newlines. Bash treats newlines as statement separators, so a sequence of
+// three independent commands across three fences runs as if the model had
+// written them in one fence. Heredocs that span fence boundaries are
+// model-author error and will fail naturally at parse time inside bash.
+//
+// Non-bash fences are ignored entirely. A reply with only a json or python
+// fence yields zero bash blocks; the caller falls back to the standard
+// <TOOL> envelope parser.
+func extractBashFenceBlocks(reply string) []string {
+	lines := strings.Split(reply, "\n")
+	var out []string
+	for i := 0; i < len(lines); {
+		ch, n, ok := parseFenceOpener(lines[i])
+		if !ok {
+			i++
+			continue
+		}
+		// Re-parse the opener line for its info string. parseFenceOpener
+		// ignores it; we need the language tag to decide whether to keep
+		// the block.
+		opener := lines[i]
+		trimmed := strings.TrimLeft(opener, " \t")
+		// Skip past the fence run.
+		runEnd := 0
+		for runEnd < len(trimmed) && trimmed[runEnd] == ch {
+			runEnd++
+		}
+		info := strings.TrimSpace(trimmed[runEnd:])
+		// Take the first whitespace-separated token as the language tag;
+		// CommonMark allows additional metadata after the tag (e.g.
+		// "bash filename=run.sh") and we don't want that confusing the
+		// match.
+		lang := info
+		if sp := strings.IndexAny(lang, " \t"); sp > 0 {
+			lang = lang[:sp]
+		}
+		bashy := false
+		switch strings.ToLower(lang) {
+		case "bash", "sh", "shell":
+			bashy = true
+		}
+		bodyStart := i + 1
+		bodyEnd := -1
+		for j := bodyStart; j < len(lines); j++ {
+			if isMatchingFenceCloser(lines[j], ch, n) {
+				bodyEnd = j
+				break
+			}
+		}
+		if bodyEnd < 0 {
+			// Unclosed fence -- skip and keep scanning.
+			i++
+			continue
+		}
+		if bashy {
+			out = append(out, strings.Join(lines[bodyStart:bodyEnd], "\n"))
+		}
+		i = bodyEnd + 1
+	}
+	return out
+}
+
+// synthesizeBashToolCallFromFences returns a toolCall{Name:"bash",...} if
+// the reply contains at least one bash-fenced block, false otherwise. Used
+// by the bash-only / fenced emit-mode parser path: callers can treat the
+// returned toolCall identically to one parsed from a <TOOL> envelope, and
+// the rest of the dispatcher needs no special-casing.
+func synthesizeBashToolCallFromFences(reply string) (toolCall, bool) {
+	blocks := extractBashFenceBlocks(reply)
+	if len(blocks) == 0 {
+		return toolCall{}, false
+	}
+	// Multi-fence -> join with \n. Newlines are bash statement separators,
+	// so a 3-fence reply becomes a 3-statement script. Comment-line headers
+	// help debugging when the trace prints the synthesized command back.
+	var cmd string
+	if len(blocks) == 1 {
+		cmd = blocks[0]
+	} else {
+		var b strings.Builder
+		for i, blk := range blocks {
+			fmt.Fprintf(&b, "# --- fence %d/%d ---\n", i+1, len(blocks))
+			b.WriteString(blk)
+			if !strings.HasSuffix(blk, "\n") {
+				b.WriteByte('\n')
+			}
+		}
+		cmd = b.String()
+	}
+	return toolCall{
+		Name: "bash",
+		Args: map[string]any{"command": cmd},
+	}, true
 }
 
 // parseFenceOpener returns (fence-char, count, true) if `line` is a valid
@@ -3430,6 +4131,107 @@ func validExtractionPath(path string) bool {
 // peak); anything above the cap is rejected with a structured error
 // nudging the reviewer to re-prompt with a smaller scope.
 const maxFilesPerCoderReply = 64
+
+// hasLegacyFileMarker reports whether a coder reply contains the v1
+// `# file: <path>` or `// file: <path>` marker convention. Used in
+// bash-only mode to detect when the coder reverted to the legacy format
+// despite the prompt telling it to use bash heredocs. The marker MUST
+// stand on its own line (start of line, optional leading whitespace) so
+// a Go comment containing the literal text `# file: foo` doesn't trip
+// the detector.
+func hasLegacyFileMarker(reply string) bool {
+	return fileMarkerRE.MatchString(reply)
+}
+
+// autoExecuteCoderBash extracts ```bash``` fences from the coder's reply,
+// joins them into a single script, runs it through the sandbox, and
+// returns a structured summary the reviewer can read. Returns "" when the
+// reply contains no fenced bash (legacy auto-extract path takes over in
+// that case for non-bash-only modes; bash-only just passes the prose).
+//
+// Behavior:
+//   - Multi-fence concatenated with `# --- fence N/M ---` boundary
+//     comments (same shape as the reviewer's fenced-emit synth)
+//   - Single bash invocation per ask_coder turn (no per-fence loop)
+//   - Tick file:<path> acceptance for any files that now exist on disk
+//     (heredoc-driven file creation can't be path-traced ahead of time;
+//     we rely on the post-run present-scan instead)
+//   - Tick bash:<exact cmd>:pass acceptance for the joined script ONLY
+//     when the script is short enough to be a verify candidate (>=64 bytes
+//     is "this is the coder writing files", < 64 bytes is "the coder
+//     emitted a one-liner that might match a planner-declared verify").
+//     The 64-byte split is a heuristic; if it bites in practice we can
+//     drop the bash:<cmd>:pass tick from the coder side entirely and
+//     rely on the reviewer running its own verification commands.
+//
+// The summary surfaces in the ask_coder result, NOT as an independent
+// trace event, so the reviewer reads it inline with the rest of the
+// coder's prose.
+func autoExecuteCoderBash(ctx context.Context, tb *toolbox.Toolbox, st *runState, reply string) string {
+	blocks := extractBashFenceBlocks(reply)
+	if len(blocks) == 0 {
+		return ""
+	}
+	var script string
+	if len(blocks) == 1 {
+		script = blocks[0]
+	} else {
+		var b strings.Builder
+		for i, blk := range blocks {
+			fmt.Fprintf(&b, "# --- fence %d/%d ---\n", i+1, len(blocks))
+			b.WriteString(blk)
+			if !strings.HasSuffix(blk, "\n") {
+				b.WriteByte('\n')
+			}
+		}
+		script = b.String()
+	}
+	r, err := tb.ShellExec(ctx, script)
+	st.trace.Emit(trace.KindToolCall, map[string]any{
+		"kind":         "auto_exec_coder_bash",
+		"fence_count":  len(blocks),
+		"script_bytes": len(script),
+		"error":        errString(err),
+	})
+	if err != nil {
+		return fmt.Sprintf("AUTO-EXEC bash FAILED: %s", err.Error())
+	}
+	// Tick acceptance for files now present and for the script itself
+	// when applicable.
+	if st.plan != nil && r.ExitCode == 0 {
+		if n := st.plan.MarkFilesPresent(tb.RepoRoot); n > 0 {
+			st.trace.Emit(trace.KindInfo, map[string]any{
+				"checklist_ticked": n,
+				"source":           "auto_exec_coder_bash_file_scan",
+			})
+		}
+		if len(script) < 64 {
+			verifyShape := "bash:" + script + ":pass"
+			if n := st.plan.MarkAcceptance(verifyShape); n > 0 {
+				st.trace.Emit(trace.KindInfo, map[string]any{
+					"checklist_ticked": n,
+					"verify":           verifyShape,
+					"source":           "auto_exec_coder_bash",
+				})
+			}
+		}
+	}
+	if r.ExitCode == 0 {
+		st.bashCmdPassCount++
+	}
+	st.bashCmdHistory = append(st.bashCmdHistory, bashCmdRecord{Command: script, ContentHash: contentHash(script), ExitCode: r.ExitCode})
+	if len(st.bashCmdHistory) > bashCmdHistoryLen {
+		st.bashCmdHistory = st.bashCmdHistory[len(st.bashCmdHistory)-bashCmdHistoryLen:]
+	}
+	st.workOps++
+	out := fmt.Sprintf("AUTO-EXEC bash: exit=%d, %d fence(s), %d bytes\nstdout:\n%s\nstderr:\n%s",
+		r.ExitCode, len(blocks), len(script),
+		shorten(r.Stdout, 2000), shorten(r.Stderr, 1000))
+	if r.Truncated {
+		out += "\n(note: output truncated by sandbox cap)"
+	}
+	return out
+}
 
 func autoExtractAndCommit(tb *toolbox.Toolbox, reply string, st *runState) string {
 	// AUDIT-ONLY MODE gate: in audit mode the orchestrator MUST NOT

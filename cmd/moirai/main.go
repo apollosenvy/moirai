@@ -66,6 +66,16 @@ type Config struct {
 	// ModelsDir is the filesystem directory scanned by GET /models for
 	// available GGUF files. Defaults to ~/models.
 	ModelsDir string `json:"models_dir,omitempty"`
+	// ToolSurface picks the tool set exposed to role models. Empty / "legacy"
+	// preserves fs.read/fs.write/fs.search/test.run/compile.run; "bash-only"
+	// switches to a single bash tool through the bwrap sandbox. See
+	// orchestrator.Config.ToolSurface for the full design rationale.
+	ToolSurface string `json:"tool_surface,omitempty"`
+	// BashEmitMode picks how the model is allowed to invoke bash when
+	// ToolSurface == "bash-only". "" / "toolcall" expects <TOOL>{...}</TOOL>
+	// envelopes; "fenced" extracts ```bash blocks from the reply and
+	// synthesizes a tool call. See orchestrator.Config.BashEmitMode.
+	BashEmitMode string `json:"bash_emit_mode,omitempty"`
 }
 
 func defaultConfig() Config {
@@ -177,6 +187,8 @@ type overrideConfig struct {
 	MaxROTurns         *int                                   `json:"max_ro_turns,omitempty"`
 	BootTimeoutSeconds *int                                   `json:"boot_timeout_seconds,omitempty"`
 	ModelsDir          string                                 `json:"models_dir,omitempty"`
+	ToolSurface        string                                 `json:"tool_surface,omitempty"`
+	BashEmitMode       string                                 `json:"bash_emit_mode,omitempty"`
 }
 
 func mergeConfig(base *Config, o overrideConfig) {
@@ -212,6 +224,12 @@ func mergeConfig(base *Config, o overrideConfig) {
 	}
 	if o.ModelsDir != "" {
 		base.ModelsDir = o.ModelsDir
+	}
+	if o.ToolSurface != "" {
+		base.ToolSurface = o.ToolSurface
+	}
+	if o.BashEmitMode != "" {
+		base.BashEmitMode = o.BashEmitMode
 	}
 	for k, v := range o.Models {
 		base.Models[k] = v
@@ -336,6 +354,8 @@ func cmdDaemon(args []string) {
 		MaxPlanRevisions: planRevisions,
 		MaxROTurns:       cfg.MaxROTurns,
 		ScratchDir:       cfg.ScratchDir,
+		ToolSurface:      cfg.ToolSurface,
+		BashEmitMode:     cfg.BashEmitMode,
 	})
 	if err != nil {
 		fatal("orchestrator: %v", err)
