@@ -30,7 +30,7 @@ const samplePlannerReply = `Here is the build plan for TraceForge.
     }
   ],
   "acceptance": [
-    {"id": "A1", "description": "npm install works", "verify": ""},
+    {"id": "A1", "description": "npm test passes", "verify": "test.run:pass"},
     {"id": "A2", "description": "tsc --noEmit passes", "verify": "compile.run:pass"},
     {"id": "A3", "description": "fixtures present", "verify": "file:fixtures/sample.jsonl"}
   ]
@@ -265,7 +265,7 @@ func TestParseUnfencedJSONWithBraceInString(t *testing.T) {
 	// brace counter (it would treat in-string braces as structural and
 	// return a misaligned slice). Post-fix the scanner respects string
 	// boundaries.
-	reply := `Here's the plan in prose, then JSON: {"phases":[{"id":"P1","name":"x","files":[{"path":"a.ts","purpose":"use { and } in the doc"}]}],"acceptance":[{"id":"A1","description":"verify {} balanced","verify":""}]}`
+	reply := `Here's the plan in prose, then JSON: {"phases":[{"id":"P1","name":"x","files":[{"path":"a.ts","purpose":"use { and } in the doc"}]}],"acceptance":[{"id":"A1","description":"verify {} balanced","verify":"test.run:pass"}]}`
 	p, err := Parse(reply)
 	if err != nil {
 		t.Fatalf("parse: %v", err)
@@ -304,9 +304,9 @@ func TestParseDeduplicatesAcceptanceIDs(t *testing.T) {
 	// makes the gate ambiguous. Parse must keep the first and drop the
 	// rest.
 	reply := "```json\n" + `{"phases":[],"acceptance":[
-		{"id":"A1","description":"first","verify":""},
-		{"id":"A1","description":"duplicate","verify":""},
-		{"id":"A2","description":"unique","verify":""}
+		{"id":"A1","description":"first","verify":"test.run:pass"},
+		{"id":"A1","description":"duplicate","verify":"test.run:pass"},
+		{"id":"A2","description":"unique","verify":"compile.run:pass"}
 	]}` + "\n```"
 	p, _ := Parse(reply)
 	if p == nil {
@@ -498,24 +498,25 @@ func TestParseRejectsControlCharsInFileSpec(t *testing.T) {
 }
 
 func TestParseRejectsEmptyFileVerifyTarget(t *testing.T) {
-	// verify:"file:" with empty path after the prefix must NOT install an
-	// acceptance item -- it would tick on any empty MarkFileWritten.
+	// verify:"file:" (empty path after prefix) and verify:"" (manual,
+	// which has no implementation) must BOTH be rejected -- the former
+	// would tick on any empty MarkFileWritten, the latter would deadlock
+	// the done() gate forever since there is no claim_acceptance tool.
+	// Closes the AAR finding that verify="" is a permanent block.
 	reply := "```json\n" + `{"phases":[],"acceptance":[
 		{"id":"A1","description":"typo","verify":"file:"},
 		{"id":"A2","description":"good","verify":"file:fixtures/sample.jsonl"},
-		{"id":"A3","description":"manual","verify":""}
+		{"id":"A3","description":"manual-claim-no-impl","verify":""}
 	]}` + "\n```"
 	p, _ := Parse(reply)
 	if p == nil {
 		t.Fatal("parse returned nil")
 	}
-	if len(p.Acceptance) != 2 {
-		t.Errorf("empty-target verify should be filtered: got %d, want 2", len(p.Acceptance))
+	if len(p.Acceptance) != 1 {
+		t.Errorf("empty-target verify and empty-string verify should both be filtered: got %d, want 1", len(p.Acceptance))
 	}
-	for _, a := range p.Acceptance {
-		if a.Verify == "file:" {
-			t.Error("empty file: verify should be removed")
-		}
+	if p.Acceptance[0].ID != "A2" {
+		t.Errorf("only A2 should survive, got %+v", p.Acceptance)
 	}
 }
 

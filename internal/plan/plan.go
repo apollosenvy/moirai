@@ -204,15 +204,18 @@ func validPlanPath(path string) bool {
 }
 
 // validAcceptanceVerify returns true if the verify string is a recognized
-// shape we know how to auto-tick. Empty is allowed (manual claim). Any
-// "file:..." verify must carry a validPlanPath payload so the gate can
-// never be tricked by an absolute or empty target. Unknown prefixes are
-// rejected so a typo (e.g. "test.run:fail") doesn't silently install an
-// acceptance item that never ticks. Closes ADV-01, ADV-02, ADV-12.
+// shape we know how to auto-tick. Any "file:..." verify must carry a
+// validPlanPath payload so the gate can never be tricked by an absolute
+// or empty target. Unknown prefixes are rejected so a typo (e.g.
+// "test.run:fail") doesn't silently install an acceptance item that
+// never ticks. Closes ADV-01, ADV-02, ADV-12.
+//
+// Empty verify ("") is REJECTED post-AAR: the original semantics ("manual
+// claim later") had no implementation -- there is no claim_acceptance
+// tool, so any verify="" item permanently deadlocked the done() gate.
+// Per the new prompt contract every acceptance must encode as
+// file:/test.run:pass/compile.run:pass; vague items get dropped.
 func validAcceptanceVerify(verify string) bool {
-	if verify == "" {
-		return true
-	}
 	if strings.HasPrefix(verify, "file:") {
 		return validPlanPath(strings.TrimPrefix(verify, "file:"))
 	}

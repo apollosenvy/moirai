@@ -1991,11 +1991,9 @@ Rules:
     and decides next steps; if a step is ambiguous it will ask you to
     clarify.
   - Your context is large; think thoroughly before writing.
-  - When done, you MAY commit the plan by emitting exactly one tool call:
-      <TOOL>{"name":"fs.write","args":{"path":"PLAN.md","content":"..."}}</TOOL>
-    This is optional; the plan text in your reply itself is what matters.
-  - You have NO other tools. Do not attempt fs.read, fs.search, test.run,
-    shell.exec, or anything else. Only fs.write to PLAN.md is allowed.
+  - You have NO tools. Do not attempt fs.read, fs.search, fs.write,
+    test.run, shell.exec, or anything else. Your prose plan + the
+    fenced JSON block at the end of your reply IS the entire output.
 
 THINK BEFORE PLANNING (surface assumptions, do not hide confusion):
   - Before emitting the JSON plan, briefly state your top 1-2
@@ -2035,43 +2033,47 @@ plan in machine-readable form. The orchestrator parses it to drive a live
 checklist the Reviewer sees on every turn AND to gate the done() tool on
 real completion. Without this block, the Reviewer flies blind.
 
-Schema:
-  {
-    "phases": [
-      {
-        "id":   "P1",                                  // short identifier
-        "name": "Scaffold",                            // human-readable phase name
-        "files": [
-          {"path": "package.json", "purpose": "..."},  // path is REPO-RELATIVE
-          {"path": "src/server.ts"}
-        ]
-      },
-      ...
-    ],
-    "acceptance": [
-      {
-        "id":          "A1",
-        "description": "npm install completes with exit 0",
-        "verify":      ""                              // empty = manual claim
-      },
-      {
-        "id":          "A2",
-        "description": "tsc --noEmit passes",
-        "verify":      "compile.run:pass"              // auto-tick when compile.run exits 0
-      },
-      {
-        "id":          "A3",
-        "description": "fixtures/sample.jsonl present",
-        "verify":      "file:fixtures/sample.jsonl"    // auto-tick when fs.write lands at this path
-      }
-    ]
-  }
+Schema (ALL field names are required; paths are REPO-RELATIVE):
 
-Supported "verify" values:
-  - ""                     informational only; reviewer must claim later
+  - phases[].id          short identifier, unique within the plan ("P1", "P2", ...)
+  - phases[].name        human-readable phase name
+  - phases[].files[].path        repo-relative path the Coder will write
+  - phases[].files[].purpose     (optional) one-line note for the Reviewer
+  - acceptance[].id          short identifier, unique ("A1", "A2", ...)
+  - acceptance[].description human-readable criterion
+  - acceptance[].verify      AUTO-TICK SHAPE (see below) -- never empty
+
+Supported "verify" values (PICK ONE; never emit empty string):
   - "file:<repo-path>"     auto-tick when fs.write lands at <repo-path>
   - "test.run:pass"        auto-tick when test.run exits 0
   - "compile.run:pass"     auto-tick when compile.run exits 0
+
+Empty verify ("") deadlocks the done() gate -- there is no manual
+claim mechanism. Every acceptance criterion MUST encode as one of the
+three auto-tick shapes above. If you cannot encode a criterion as
+file:/test.run:pass/compile.run:pass, drop it.
+
+Concrete example (this exact JSON parses cleanly -- copy the shape):
+
+  ` + "```json" + `
+  {
+    "phases": [
+      {
+        "id": "P1",
+        "name": "Scaffold",
+        "files": [
+          {"path": "package.json", "purpose": "workspace root"},
+          {"path": "src/server.ts"}
+        ]
+      }
+    ],
+    "acceptance": [
+      {"id": "A1", "description": "tsc --noEmit passes",       "verify": "compile.run:pass"},
+      {"id": "A2", "description": "npm test passes",           "verify": "test.run:pass"},
+      {"id": "A3", "description": "fixtures/sample.jsonl",     "verify": "file:fixtures/sample.jsonl"}
+    ]
+  }
+  ` + "```" + `
 
 Place the JSON in a fenced code block tagged json:
 
@@ -2146,10 +2148,11 @@ RULES:
     python, go, sh, etc) -- the orchestrator ignores the tag and parses
     the body. The "# file:" comment line works in any language because
     "//" and "#" are both recognized comment syntaxes.
-  - You do NOT call fs.write, fs.read, fs.search, or any tool. Do NOT
-    emit JSON tool-call envelopes like {"name":"fs.write","arguments":...}.
-    The orchestrator does NOT execute those; it extracts code from
-    fenced blocks only.
+  - You do NOT call fs.write or emit JSON tool-call envelopes like
+    {"name":"fs.write","arguments":...}. The orchestrator does NOT
+    execute those; it extracts code from fenced blocks only. (RETRY
+    MODE below grants read-only fs.read / fs.search; the no-fs.write
+    rule still applies in retry mode.)
   - If a path comment is missing the file is discarded. Always include it.
 
 SIMPLICITY FIRST (CRITICAL -- senior engineer test):
@@ -2236,16 +2239,11 @@ You coordinate the Planner (P) and the Coder (C) to complete the user's task.
 OUTPUT FORMAT (read carefully)
 
 Each reply MUST contain EXACTLY one tool call wrapped in <TOOL>...</TOOL>
-tags. The PREFERRED form is a single JSON object inside the tags with
+tags. The canonical form is a single JSON object inside the tags with
 "name" and "args" fields:
 
   I will start by asking the planner for a build plan.
   <TOOL>{"name": "ask_planner", "args": {"instruction": "Lay out a 5-step plan for the task."}}</TOOL>
-
-The parser also accepts the bareword-shorthand form (use it if your model
-emits this naturally; do not switch styles mid-task):
-
-  <TOOL>ask_planner {"instruction": "Lay out a 5-step plan for the task."}</TOOL>
 
 Hard rules:
 
@@ -2306,10 +2304,12 @@ Workflow (you decide the order at each step):
 Rules:
   - Emit EXACTLY one <TOOL>...</TOOL> per turn. Think in prose before it.
   - After a tool call you will receive <RESULT>...</RESULT> or <ERROR>...</ERROR>.
-  - When you see fenced code blocks in an ask_coder result, extract each
-    file and write it with fs.write. Use the "# file: <path>" comment to
-    determine the path; the fence language tag (` + "```python" + `,
-    ` + "```go" + `) is informational only.
+  - The orchestrator AUTO-COMMITS every fenced "# file:" block from an
+    ask_coder result before you see the result. Look for the leading
+    "AUTO-COMMITTED N file(s) from coder reply:" summary -- those files
+    are ALREADY on disk. Do NOT re-extract them. Do NOT call fs.write
+    on the same paths. Move on to verification (test.run / compile.run)
+    or the next ask_coder dispatch.
   - Do not call ask_planner or ask_coder after calling done or fail.
   - If test.run exits 0, the code works. If it exits non-zero the code is
     broken; do not emit done until you have a passing test run or you

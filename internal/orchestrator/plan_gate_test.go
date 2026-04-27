@@ -45,8 +45,8 @@ func TestDoneGateRefusesUnsatisfiedAcceptance(t *testing.T) {
 	}
 
 	planJSON := "```json\n" + `{"phases":[],"acceptance":[
-		{"id":"A1","description":"the unmet criterion","verify":""},
-		{"id":"A2","description":"another unmet","verify":""}
+		{"id":"A1","description":"the unmet criterion","verify":"test.run:pass"},
+		{"id":"A2","description":"another unmet","verify":"compile.run:pass"}
 	]}` + "\n```"
 	p, err := plan.Parse(planJSON)
 	if err != nil || p == nil {
@@ -129,7 +129,7 @@ func TestDoneGatePassesWhenAllAcceptanceSatisfied(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 
-	p, err := plan.Parse("```json\n" + `{"phases":[],"acceptance":[{"id":"A1","description":"x","verify":""}]}` + "\n```")
+	p, err := plan.Parse("```json\n" + `{"phases":[],"acceptance":[{"id":"A1","description":"x","verify":"test.run:pass"}]}` + "\n```")
 	if err != nil || p == nil {
 		t.Fatalf("plan.Parse: %v", err)
 	}
