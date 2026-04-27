@@ -275,6 +275,18 @@ type runState struct {
 	pensiveSearchCalls int
 	roTurns            int
 
+	// Test/compile invocation counters. The done() gate uses these to
+	// detect "acceptance gaslighting": a model that calls done() with
+	// summary="tests pass!" having never actually invoked test.run.
+	// The acceptance-tick gate already catches this (no auto-tick =
+	// unsatisfied) but its error message was generic. With these
+	// counters the gate can say specifically WHICH evidence is
+	// missing (the model never ran test.run / compile.run).
+	testRunCount     int // increments on every test.run dispatch (success or not)
+	testRunPassCount int // increments only when exit 0
+	compileRunCount  int
+	compileRunPassCount int
+
 	// workOps counts "real work" tool invocations so the done() guard can
 	// reject premature termination. Increments on ask_coder, fs.write,
 	// test.run, compile.run. Read-only tools (fs.read, fs.search,
@@ -1174,7 +1186,40 @@ func (o *Orchestrator) roLoop(ctx context.Context, st *runState, tb *toolbox.Too
 					b.WriteString(u)
 					b.WriteString("\n")
 				}
-				b.WriteString("Run test.run / compile.run / write the missing files (see <CHECKLIST>), then retry done.")
+				// Acceptance gaslighting diagnostic: detect the model
+				// claiming "tests pass" without ever invoking test.run /
+				// compile.run, and call it out specifically. The plan
+				// has unmet items with verify="test.run:pass" or
+				// "compile.run:pass" -- if the corresponding tool has
+				// never been called successfully (or at all), say so.
+				needsTestRun := false
+				needsCompileRun := false
+				for _, a := range st.plan.Acceptance {
+					if a.Satisfied {
+						continue
+					}
+					switch a.Verify {
+					case "test.run:pass":
+						needsTestRun = true
+					case "compile.run:pass":
+						needsCompileRun = true
+					}
+				}
+				if needsTestRun && st.testRunPassCount == 0 {
+					if st.testRunCount == 0 {
+						b.WriteString("\nDIAGNOSTIC: test.run has NEVER been called this run. test.run:pass acceptance items cannot tick by intuition; call test.run as a tool to gather real evidence.")
+					} else {
+						b.WriteString(fmt.Sprintf("\nDIAGNOSTIC: test.run has been called %d time(s) but has not yet exited 0. Inspect the failures, dispatch ask_coder for a fix, then retry test.run.", st.testRunCount))
+					}
+				}
+				if needsCompileRun && st.compileRunPassCount == 0 {
+					if st.compileRunCount == 0 {
+						b.WriteString("\nDIAGNOSTIC: compile.run has NEVER been called this run. compile.run:pass acceptance items cannot tick by intuition; call compile.run as a tool to gather real evidence.")
+					} else {
+						b.WriteString(fmt.Sprintf("\nDIAGNOSTIC: compile.run has been called %d time(s) but has not yet exited 0. Inspect the failures, dispatch ask_coder for a fix, then retry compile.run.", st.compileRunCount))
+					}
+				}
+				b.WriteString("\nRun test.run / compile.run / write the missing files (see <CHECKLIST>), then retry done.")
 				errMsg := b.String()
 				tr.Emit(trace.KindToolCall, map[string]any{
 					"kind":             "ro_tool_call",
@@ -1745,6 +1790,7 @@ func (o *Orchestrator) executeROTool(ctx context.Context, st *runState, tb *tool
 		return string(b), nil
 
 	case "test.run":
+		st.testRunCount++
 		r, err := tb.TestRun(ctx)
 		if err != nil {
 			// Mark retry flag so next ask_coder gets read access.
@@ -1757,6 +1803,7 @@ func (o *Orchestrator) executeROTool(ctx context.Context, st *runState, tb *tool
 			st.lastTestFailed = true
 		} else {
 			st.lastTestFailed = false
+			st.testRunPassCount++
 			// Tick acceptance items with verify="test.run:pass". Always
 			// emit the trace event when the plan is loaded and the run
 			// succeeded -- distinguishes "no acceptance with that verify"
@@ -1775,12 +1822,14 @@ func (o *Orchestrator) executeROTool(ctx context.Context, st *runState, tb *tool
 		return out, nil
 
 	case "compile.run":
+		st.compileRunCount++
 		r, err := tb.CompileRun(ctx)
 		if err != nil {
 			return "", err
 		}
 		st.workOps++
 		if r.ExitCode == 0 {
+			st.compileRunPassCount++
 			if st.plan != nil {
 				n := st.plan.MarkAcceptance("compile.run:pass")
 				st.trace.Emit(trace.KindInfo, map[string]any{

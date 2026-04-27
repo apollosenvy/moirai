@@ -112,6 +112,81 @@ func TestDoneGateRefusesUnsatisfiedAcceptance(t *testing.T) {
 	}
 }
 
+// TestDoneGateGaslightingDiagnostic pins the AAR-era gaslighting
+// rejection: when the model calls done() with unsatisfied test.run:pass
+// acceptance AND has NEVER actually called test.run, the rejection
+// error must say so explicitly. Generic "acceptance not satisfied"
+// would let the model think the issue is somewhere else; the
+// "DIAGNOSTIC: test.run has NEVER been called" line names the actual
+// missing evidence.
+func TestDoneGateGaslightingDiagnostic(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	store, _ := taskstore.Open(filepath.Join(t.TempDir(), "tasks"))
+
+	stub := &stubModelMgr{
+		responses: []string{
+			`<TOOL>{"name":"done","args":{"summary":"tests pass; calling done"}}</TOOL>`,
+		},
+	}
+	o, err := New(Config{Store: store, ModelMgr: stub, MaxROTurns: 2})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	planJSON := "```json\n" + `{"phases":[],"acceptance":[
+		{"id":"A1","description":"npm test passes","verify":"test.run:pass"},
+		{"id":"A2","description":"tsc passes","verify":"compile.run:pass"}
+	]}` + "\n```"
+	p, err := plan.Parse(planJSON)
+	if err != nil || p == nil {
+		t.Fatalf("plan.Parse: %v", err)
+	}
+
+	id := "gaslight-" + newTaskID()
+	task := &taskstore.Task{ID: id, Status: taskstore.StatusRunning, RepoRoot: t.TempDir()}
+	_ = store.Save(task)
+	tw, _ := trace.Open(id)
+	defer tw.Close()
+
+	st := &runState{
+		cancel:  func() {},
+		task:    task,
+		trace:   tw,
+		plan:    p,
+		workOps: 1, // pre-seed past the work-before-done guard
+		// testRunCount = 0, compileRunCount = 0 -> gaslighting shape
+	}
+
+	_, _, _ = o.roLoop(context.Background(), st, nil)
+
+	// The error message that went back to the model must call out the
+	// missing test.run AND compile.run evidence.
+	if len(stub.messages) < 1 {
+		t.Fatal("stub saw zero Complete calls")
+	}
+	// The error is a user-role message in the convo; it goes after the
+	// rejected done call. Find any message containing the diagnostic.
+	var sawTestRunDiag, sawCompileRunDiag bool
+	for _, msgs := range stub.messages {
+		for _, m := range msgs {
+			if strings.Contains(m.Content, "test.run has NEVER been called") {
+				sawTestRunDiag = true
+			}
+			if strings.Contains(m.Content, "compile.run has NEVER been called") {
+				sawCompileRunDiag = true
+			}
+		}
+	}
+	// Loop may exit on first rejection or after MaxROTurns; either way
+	// the diagnostic should have appeared at least once.
+	if !sawTestRunDiag {
+		t.Error("done() rejection should diagnose 'test.run has NEVER been called' when test.run:pass acceptance is unmet and counter is 0")
+	}
+	if !sawCompileRunDiag {
+		t.Error("done() rejection should diagnose 'compile.run has NEVER been called' when compile.run:pass acceptance is unmet and counter is 0")
+	}
+}
+
 // TestDoneGatePassesWhenAllAcceptanceSatisfied verifies the inverse: when
 // every acceptance item IS satisfied, done() is allowed to terminate.
 // Together with the rejection test, this pins the gate's contract.
