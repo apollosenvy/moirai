@@ -28,6 +28,7 @@ func TestPlannerSystemPromptContainsParserContract(t *testing.T) {
 		"PHASE GRANULARITY",          // phase-sizing guidance
 		"THINK BEFORE PLANNING",      // Karpathy: surface assumptions
 		"GOAL-DRIVEN ACCEPTANCE",     // Karpathy: every criterion is a test
+		"PARANOID ABOUT AMBIGUITY",   // stance line
 	} {
 		if !strings.Contains(prompt, want) {
 			t.Errorf("plannerSystemPrompt missing required substring %q", want)
@@ -98,6 +99,9 @@ func TestReviewerSystemPromptContainsGoalDriven(t *testing.T) {
 			"GOAL-DRIVEN EXECUTION", // section header
 			"failing test",          // Karpathy: write failing test, then make it pass
 			"BEFORE done()",         // pressure to call test.run before terminating
+			"GATEKEEPER",            // stance line
+			"REVIEW DISCIPLINE",     // RO actually reviews, not just routes
+			"scope creep",           // pressure to push back when coder over-builds
 		} {
 			if !strings.Contains(prompt, want) {
 				t.Errorf("roSystemPrompt(auditMode=%v) missing required substring %q", auditMode, want)
