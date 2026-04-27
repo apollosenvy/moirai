@@ -874,8 +874,13 @@ func (o *Orchestrator) roLoop(ctx context.Context, st *runState, tb *toolbox.Too
 	// format and dramatically reduces no_tool_call nudges in early turns.
 	// The synthetic task is a no-op (a hello task with a fake "ok" verdict)
 	// so it cannot leak into the real plan; the model just sees the shape.
+	// Conditionally render the AUDIT-ONLY MODE block ONLY when the task
+	// description begins with the "AUDIT-ONLY:" prefix. Default reviews
+	// burn ~70 lines of context on rules that don't apply, and Gemini's
+	// AAR pointed out the lost-in-the-middle risk. Closes that finding.
+	auditMode := strings.HasPrefix(t.Description, "AUDIT-ONLY:")
 	messages := []modelmgr.ChatMessage{
-		{Role: "system", Content: roSystemPrompt()},
+		{Role: "system", Content: roSystemPrompt(auditMode)},
 		{Role: "user", Content: "Task:\nWrite a hello-world script.\n\nRepo root: /tmp/example\nBranch: example/demo\n\nBegin. Think about what to do first, then emit a single tool call wrapped in <TOOL>...</TOOL>."},
 		{Role: "assistant", Content: `Hello-world is small enough that I can dispatch the coder directly without a planner round. I will instruct the coder to produce a single Python script.
 
@@ -2232,8 +2237,8 @@ SURGICAL CHANGES (retry-mode discipline):
 // TODO(rename): the prompt below references the audit-mode checklist
 // directory ".agent-router/" by literal path. When the on-disk dir migrates
 // to ".moirai/", update the prompt strings here too.
-func roSystemPrompt() string {
-	return `You are the Reviewer-Orchestrator.
+func roSystemPrompt(auditMode bool) string {
+	base := `You are the Reviewer-Orchestrator.
 You coordinate the Planner (P) and the Coder (C) to complete the user's task.
 
 OUTPUT FORMAT (read carefully)
@@ -2349,11 +2354,14 @@ GOAL-DRIVEN EXECUTION (every dispatch carries its own success test):
   - "Add a feature" -> "name the test that proves it works first."
   - "Make it faster" -> "what's the measurable threshold; what test
     enforces it?"
-
-AUDIT-ONLY MODE
-If the user task description begins with "AUDIT-ONLY:" you are in
-audit mode. The codebase already exists. Your job is to FIND BUGS,
-not write fixes. Rules for audit mode:
+`
+	if !auditMode {
+		return base
+	}
+	return base + `
+AUDIT-ONLY MODE (this task description began with "AUDIT-ONLY:")
+The codebase already exists. Your job is to FIND BUGS, not write
+fixes. Rules for audit mode:
 
   - DO NOT call ask_coder for code generation. DO NOT include "# file:"
     markers in any output. Auto-extract is your enemy here.

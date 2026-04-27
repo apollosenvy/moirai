@@ -87,15 +87,54 @@ func TestCoderSystemPromptRetryModeAddsFsAccess(t *testing.T) {
 // that every dispatch carries its own success test. A regression that
 // drops this section silently lets the reviewer fall back to vibes
 // (dispatch "fix it" without a test, call done() without test.run).
+//
+// Tests both auditMode=false (normal builds) and auditMode=true: the
+// Goal-Driven section MUST be present in both renderings, since it
+// applies to every reviewer dispatch.
 func TestReviewerSystemPromptContainsGoalDriven(t *testing.T) {
-	prompt := roSystemPrompt()
-	for _, want := range []string{
-		"GOAL-DRIVEN EXECUTION", // section header
-		"failing test",          // Karpathy: write failing test, then make it pass
-		"BEFORE done()",         // pressure to call test.run before terminating
-	} {
-		if !strings.Contains(prompt, want) {
-			t.Errorf("roSystemPrompt missing required substring %q", want)
+	for _, auditMode := range []bool{false, true} {
+		prompt := roSystemPrompt(auditMode)
+		for _, want := range []string{
+			"GOAL-DRIVEN EXECUTION", // section header
+			"failing test",          // Karpathy: write failing test, then make it pass
+			"BEFORE done()",         // pressure to call test.run before terminating
+		} {
+			if !strings.Contains(prompt, want) {
+				t.Errorf("roSystemPrompt(auditMode=%v) missing required substring %q", auditMode, want)
+			}
 		}
+	}
+}
+
+// TestReviewerSystemPromptAuditModeConditional pins the AAR finding
+// that AUDIT-ONLY MODE was being injected into every reviewer prompt
+// even when the task wasn't an audit -- ~70 lines of context burn for
+// 99% of tasks, plus lost-in-the-middle risk. Now gated on the auditMode
+// flag the orchestrator computes from the task description prefix.
+func TestReviewerSystemPromptAuditModeConditional(t *testing.T) {
+	normal := roSystemPrompt(false)
+	audit := roSystemPrompt(true)
+
+	// AUDIT-ONLY content must NOT be in the normal-mode prompt.
+	for _, marker := range []string{
+		"AUDIT-ONLY MODE",
+		"AUDIT PERSONA ROTATION",
+		"security-OWASP",
+		"CHECKLIST DISCIPLINE",
+	} {
+		if strings.Contains(normal, marker) {
+			t.Errorf("auditMode=false prompt should NOT contain %q (~70-line context burn for normal tasks)", marker)
+		}
+		if !strings.Contains(audit, marker) {
+			t.Errorf("auditMode=true prompt MUST contain %q", marker)
+		}
+	}
+	// audit-mode prompt strictly extends normal prompt.
+	if !strings.HasPrefix(audit, normal) {
+		t.Error("auditMode=true prompt must extend (not replace) the normal prompt")
+	}
+	// Sanity: audit-mode addition is meaningfully large.
+	if len(audit) <= len(normal)+500 {
+		t.Errorf("audit-mode addition is suspiciously small: normal=%d audit=%d", len(normal), len(audit))
 	}
 }
