@@ -2,6 +2,8 @@
 bin/
 build/
 /agent-router
+/agent-router-*
+/agent-router.bak
 /phos/build/
 /phos/ui/node_modules/
 /phos/ui/dist/
