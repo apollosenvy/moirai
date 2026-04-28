@@ -41,6 +41,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -443,6 +444,13 @@ type runState struct {
 	// MUST be "user" and messages[idx].Content MUST start with
 	// "<CHECKLIST>". The injection site asserts this before mutating.
 	lastChecklistMsgIdx int
+
+	// F8 force-conclude: tracks which stage of the budget-warning cascade
+	// we have already injected into the message stream. Stages are
+	// "" (not yet warned), "warning" (≤5 turns OR ≤5 min remaining), and
+	// "final" (≤1 turn OR ≤1 min remaining). Each stage is injected at
+	// most once so the model isn't drowned in repeat warnings every turn.
+	forceConcludeStage string
 
 	// Flag: has a test.run failed since the last ask_coder? If so, the next
 	// ask_coder should get fs.read + fs.search access.
@@ -1370,6 +1378,60 @@ func (o *Orchestrator) roLoop(ctx context.Context, st *runState, tb *toolbox.Too
 				return "", false, fmt.Errorf("ro turn %d: ensure reviewer: %w", st.roTurns, err)
 			}
 			tr.Emit(trace.KindSwap, map[string]any{"to": "reviewer", "reason": "ro_resume"})
+		}
+
+		// F8 force-conclude: when nearing the turn budget OR the wall-clock
+		// budget, inject a directive that demands the reviewer call done()
+		// or fail() rather than starting new work. Two triggers:
+		//   - turn-based: 5 turns or fewer remaining of MaxROTurns
+		//   - time-based: 5 minutes or fewer of ctx deadline left
+		// At "warning" stage (5-turns-or-5-min), inject a soft nudge.
+		// At "final" stage (1-turn-or-1-min), inject a hard demand.
+		// The same-stage message is injected at most once per stage so the
+		// model isn't drowned in repeat warnings.
+		turnsRemaining := o.cfg.MaxROTurns - st.roTurns
+		var timeRemaining time.Duration
+		if dl, hasDL := ctx.Deadline(); hasDL {
+			timeRemaining = time.Until(dl)
+		}
+		// Threshold tuned 2026-04-28: 5/1-min thresholds were too tight for
+		// slow-decoding reviewers (gpt-oss-20b at 10-15 tok/s on 24GB VRAM
+		// can spend 5-8 minutes on a single reasoning-heavy turn). Bumping
+		// to 8/2-min so the warning lands BEFORE a single long turn can
+		// blow the remaining budget.
+		stage := ""
+		if turnsRemaining <= 2 || (timeRemaining > 0 && timeRemaining <= 2*time.Minute) {
+			stage = "final"
+		} else if turnsRemaining <= 8 || (timeRemaining > 0 && timeRemaining <= 8*time.Minute) {
+			stage = "warning"
+		}
+		if stage != "" && st.forceConcludeStage != stage {
+			st.forceConcludeStage = stage
+			var msg string
+			if stage == "warning" {
+				msg = "[FORCE-CONCLUDE WARNING] You are nearing the budget for this task " +
+					"(turns_remaining=" + strconv.Itoa(turnsRemaining) +
+					", time_remaining≈" + timeRemaining.Round(time.Second).String() + "). " +
+					"Begin closing out NOW. " +
+					"If the artifact materially satisfies the original task per the acceptance criteria, " +
+					"call <TOOL>{\"name\":\"done\",\"args\":{\"summary\":\"...\"}}</TOOL>. " +
+					"If you are blocked or the artifact is not deliverable, call " +
+					"<TOOL>{\"name\":\"fail\",\"args\":{\"reason\":\"...\"}}</TOOL> " +
+					"with a concrete explanation citing mechanical evidence (compile.run / test.run output). " +
+					"Do NOT start new files or new directions. Verify what you have, then conclude."
+			} else {
+				msg = "[FORCE-CONCLUDE FINAL] This is your last allowed turn. Emit EXACTLY one of:\n" +
+					"  <TOOL>{\"name\":\"done\",\"args\":{\"summary\":\"...\"}}</TOOL> if the artifact is deliverable\n" +
+					"  <TOOL>{\"name\":\"fail\",\"args\":{\"reason\":\"...\"}}</TOOL> if it is not\n" +
+					"No more fs.write, no more ask_coder, no more compile.run. Anything other than done/fail terminates as exceeded-budget."
+			}
+			messages = append(messages, modelmgr.ChatMessage{Role: "user", Content: msg})
+			tr.Emit(trace.KindInfo, map[string]any{
+				"force_conclude":  stage,
+				"turns_remaining": turnsRemaining,
+				"time_remaining":  timeRemaining.Round(time.Second).String(),
+				"turn":            st.roTurns,
+			})
 		}
 
 		// Inject the live <CHECKLIST> block when the structured plan has

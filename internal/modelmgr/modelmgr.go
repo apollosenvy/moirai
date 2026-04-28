@@ -356,7 +356,25 @@ func (m *Manager) EnsureSlot(ctx context.Context, slot Slot) (string, error) {
 	if m.activeSlot == slot && m.cmd != nil && m.cmd.Process != nil {
 		port := m.port
 		m.mu.Unlock()
-		return fmt.Sprintf("http://127.0.0.1:%d", port), nil
+		// F9 liveness: a stale `m.cmd` can outlive its underlying llama-server
+		// process when the child EOFs mid-decode (observed in production after
+		// reviewer-side OOMs and SIGSEGVs in custom kernels). Trusting
+		// activeSlot==slot && cmd!=nil leaves the daemon wedged for that slot
+		// because the next /v1/chat/completions hits "connection refused".
+		// Ping /v1/models with a short deadline; if it doesn't answer, treat
+		// the slot as cold and fall through to a fresh start().
+		if isLlamaServerHealthy(port, 1*time.Second) {
+			return fmt.Sprintf("http://127.0.0.1:%d", port), nil
+		}
+		fmt.Fprintf(os.Stderr, "modelmgr: active slot %s on port %d failed liveness probe; respawning\n", slot, port)
+		// Clear cached active state. The actual process may still hold the
+		// PID but its HTTP listener is dead; the subsequent stop() will reap
+		// it and start() will spawn fresh.
+		m.mu.Lock()
+		m.activeSlot = ""
+		// Re-lock for the unified "fall through to spawn" path below; we
+		// release exactly once after reading from/cfg, just like the
+		// original cold-call path.
 	}
 	from := m.activeSlot
 	cfg, ok := m.cfg.Models[slot]
@@ -665,6 +683,21 @@ func DetectTurboquant(llamaServerBin string) bool {
 }
 
 // waitReady polls the OpenAI-compatible /v1/models endpoint until success.
+// isLlamaServerHealthy probes /v1/models with a short timeout to detect
+// whether the llama-server on `port` is still answering. Used by EnsureSlot
+// to avoid reusing a slot whose underlying child process EOF'd mid-decode.
+// Returns true on a 200 OK within `timeout`.
+func isLlamaServerHealthy(port int, timeout time.Duration) bool {
+	url := fmt.Sprintf("http://127.0.0.1:%d/v1/models", port)
+	client := &http.Client{Timeout: timeout}
+	resp, err := client.Get(url)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode == 200
+}
+
 func waitReady(ctx context.Context, port int, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	url := fmt.Sprintf("http://127.0.0.1:%d/v1/models", port)
