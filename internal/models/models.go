@@ -6,10 +6,17 @@ package models
 
 import (
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
 )
+
+// maxScanDepth caps how deep ListGGUF will recurse from the scan root.
+// Real model stables nest 1-2 levels (e.g. ~/Models/<family>/<quant>.gguf).
+// 4 is generous headroom without letting a misconfigured root (someone
+// pointing models_dir at $HOME) walk an entire filesystem tree.
+const maxScanDepth = 4
 
 // Info describes a single GGUF model file on disk.
 type Info struct {
@@ -21,39 +28,78 @@ type Info struct {
 	TurboquantSafe bool   `json:"turboquant_safe"` // head_dim != 128
 }
 
-// ListGGUF scans dir (non-recursive) for *.gguf files.
+// ListGGUF scans dir recursively (up to maxScanDepth levels) for *.gguf files.
+//
+// Recursion was added 2026-04-28: real model stables nest by family
+// (~/Models/gemma/*.gguf, ~/Models/Qwen3-Coder-30B-A3B/*.gguf etc.) and the
+// previous non-recursive scan returned an empty picker for any non-flat
+// layout, causing the UI's slot-swap dropdown to silently miss most of the
+// stable. Symlinks (file or directory) are NOT followed: WalkDir visits a
+// symlink without dereferencing it, which prevents loops and keeps the depth
+// counter honest. Hidden directories (name beginning with `.`) are skipped
+// to avoid traversing version-control internals.
 func ListGGUF(dir string) ([]Info, error) {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
+	if _, err := os.Stat(dir); err != nil {
 		if os.IsNotExist(err) {
 			return []Info{}, nil
 		}
 		return nil, err
 	}
 	var out []Info
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
-		}
-		if !strings.HasSuffix(strings.ToLower(e.Name()), ".gguf") {
-			continue
-		}
-		full := filepath.Join(dir, e.Name())
-		stat, err := os.Stat(full)
+	rootClean := filepath.Clean(dir)
+	walkErr := filepath.WalkDir(rootClean, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
-			continue
+			// A single unreadable subtree (permissions, broken symlink target)
+			// must not abort the whole scan. Skip the offender and keep going.
+			if d != nil && d.IsDir() {
+				return fs.SkipDir
+			}
+			return nil
 		}
-		info := Info{
-			Path:      full,
-			Name:      strings.TrimSuffix(e.Name(), ".gguf"),
+
+		if d.IsDir() {
+			// Depth check relative to root. Counting separators after stripping
+			// the root prefix is robust to trailing slashes and Clean()'s
+			// normalisation of `./` and `../`.
+			rel, _ := filepath.Rel(rootClean, path)
+			if rel == "." {
+				return nil
+			}
+			depth := strings.Count(rel, string(filepath.Separator)) + 1
+			if depth > maxScanDepth {
+				return fs.SkipDir
+			}
+			// Skip hidden directories (.git, .cache, etc.) -- they cannot
+			// contain user-curated GGUFs and slow down deep stables.
+			if strings.HasPrefix(d.Name(), ".") {
+				return fs.SkipDir
+			}
+			return nil
+		}
+
+		// Files: only *.gguf, case-insensitive.
+		if !strings.HasSuffix(strings.ToLower(d.Name()), ".gguf") {
+			return nil
+		}
+		stat, statErr := os.Stat(path)
+		if statErr != nil {
+			return nil
+		}
+		out = append(out, Info{
+			Path:      path,
+			Name:      strings.TrimSuffix(d.Name(), ".gguf"),
 			SizeBytes: stat.Size(),
-		}
-		// head_dim parsing is not implemented; GGUF KV metadata parsing is
-		// out of scope for this package. Until it lands, we assume every
-		// enumerated model is turboquant-safe. Known-bad head_dim=128 models
-		// are rejected via explicit manifest, not via this enumerator.
-		info.TurboquantSafe = info.HeadDim != 128
-		out = append(out, info)
+			// head_dim parsing is not implemented; GGUF KV metadata parsing
+			// is out of scope for this package. Until it lands, we assume
+			// every enumerated model is turboquant-safe. Known-bad
+			// head_dim=128 models are rejected via explicit manifest, not
+			// via this enumerator.
+			TurboquantSafe: true,
+		})
+		return nil
+	})
+	if walkErr != nil {
+		return nil, walkErr
 	}
 	return out, nil
 }
