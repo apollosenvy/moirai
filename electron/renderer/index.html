@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Moirai</title>
+<!--
+  Self-hosted WOFF2 fonts under /fonts/. No CDN call so first paint
+  works offline and inside Electron without network.
+-->
+<style>
+@font-face {
+  font-family: 'Inter';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url('./fonts/Inter-Regular.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'JetBrains Mono';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url('./fonts/JetBrainsMono-Regular.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'JetBrains Mono';
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url('./fonts/JetBrainsMono-Medium.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'Monaspace Krypton';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url('./fonts/MonaspaceKrypton-Regular.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'Monaspace Krypton';
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url('./fonts/MonaspaceKrypton-Medium.woff2') format('woff2');
+}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="module" src="/src/main.tsx"></script>
+</body>
+</html>

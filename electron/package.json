@@ -1,0 +1,37 @@
+{
+  "name": "moirai-electron",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Moirai desktop UI (Electron). Daemon-facing shell ported from the internal Phos build.",
+  "main": "main.cjs",
+  "scripts": {
+    "dev": "MOIRAI_DEV=1 electron .",
+    "start": "electron .",
+    "build:renderer": "cd renderer && npm run build",
+    "build": "npm run build:renderer && electron-builder",
+    "test:renderer": "cd renderer && npm run test",
+    "test": "npm run test:renderer"
+  },
+  "devDependencies": {
+    "electron": "^32.0.0",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "net.aegis.moirai",
+    "productName": "Moirai",
+    "files": [
+      "main.cjs",
+      "preload.cjs",
+      "renderer/dist/**/*",
+      "package.json"
+    ],
+    "directories": {
+      "buildResources": "build-resources",
+      "output": "dist-app"
+    },
+    "linux": {
+      "target": ["AppImage", "deb"],
+      "category": "Development"
+    }
+  }
+}

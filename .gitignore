@@ -4,10 +4,29 @@ build/
 /agent-router
 /agent-router-*
 /agent-router.bak
-/phos/build/
-/phos/ui/node_modules/
-/phos/ui/dist/
-/phos/ui/tsconfig.tsbuildinfo
+
+# Internal-only: kept local, never published.
+# `phos/` is the internal C++/native shell we run on Gary's box. The
+# public Electron app under `electron/` has feature parity with it; the
+# Phos build stays local because it's tuned for one specific machine.
+/phos/
+
+# Internal docs: planning artefacts, infra-cost notes, design briefs
+# that pair with the internal Phos build.
+/MI300X_PLAN.md
+/docs/superpowers/
+/docs/hex-fabric-design-brief.md
+/scripts/vendor-fonts.sh
+
+# Per-project Claude / agent instructions, anywhere in the tree.
+**/CLAUDE.md
+
+# Electron build outputs
+/electron/node_modules/
+/electron/renderer/node_modules/
+/electron/renderer/dist/
+/electron/renderer/tsconfig.tsbuildinfo
+/electron/dist-app/
 
 # IDE
 .vscode/

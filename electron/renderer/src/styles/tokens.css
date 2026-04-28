@@ -1,0 +1,108 @@
+/* Hex Fabric design tokens.
+   Extracted verbatim from the :root block of
+   electron-renderer source design (Hex Fabric brief)
+
+   No external @imports here. The original draft pulled Monaspace Krypton,
+   JetBrains Mono, and Inter from Google Fonts + jsdelivr on every UI load,
+   which (a) phones home from a desktop-app shell, (b) blocks first paint
+   until the CDN responds, and (c) leaks the user's launch time + IP to
+   third parties. Desktop apps must not phone home on launch. The
+   --ff-mono-display / --ff-mono-num / --ff-sans variables below already
+   chain to system-ui / ui-monospace fallbacks, so the UI degrades to the
+   user's installed monospace + sans-serif when the named faces are not
+   present locally. If we ever need pixel-exact branding we should vendor
+   WOFF2 files into public/fonts/ and reference them with a local
+   @font-face block, not pull from the network at runtime. */
+
+:root {
+  /* --- Surfaces --- */
+  --void: #04060b;
+  --panel: #0a1424;
+  --panel-hi: #0f1b30;
+  --fabric: #172640;
+  --trace: #1f3355;
+  --border: #264060;
+  --border-hi: #3a5a80;
+  /* --- Neon accents --- */
+  --ice: #00c8ff;
+  --ice-dim: #007aa0;
+  --magenta: #ff2bd6;
+  --amber: #ffb347;
+  --lime: #39ff88;
+  --plasma: #b14dff;
+  /* --- Text --- */
+  --text: #e6ecf5;
+  --text-dim: #96a8c2;
+  --text-mute: #526884;
+  --rule: #22334d;
+  /* --- Motion --- */
+  --t-snap: 80ms;
+  --t-quick: 150ms;
+  --t-base: 250ms;
+  --t-flow: 400ms;
+  --t-swap: 800ms;
+  --t-pulse: 2000ms;
+  --e-soft: cubic-bezier(.4,0,.2,1);
+  --e-snap: cubic-bezier(.4,0,1,1);
+  --e-arrive: cubic-bezier(0,0,.2,1);
+  /* --- Type --- */
+  --ff-mono-display: "Monaspace Krypton", ui-monospace, "SF Mono", monospace;
+  --ff-mono-num: "JetBrains Mono", ui-monospace, monospace;
+  --ff-sans: "Inter", system-ui, sans-serif;
+}
+
+/* Self-hosted WOFF2 faces. These live in public/fonts/ and ship with
+   the Phos asset bundle so the UI never reaches out to a CDN at launch
+   (see brief §14 -- WebKitGTK does not resolve system fonts the way
+   Chromium does, and a desktop app must not phone home).
+
+   Sources, all open-licensed:
+     - Monaspace Krypton (Apache 2.0)  -- subset of MonaspiceKr from the
+       otf-monaspace-nerd Arch package
+     - JetBrains Mono   (SIL OFL 1.1) -- subset of system /usr/share/fonts/TTF
+     - Inter            (SIL OFL 1.1) -- subset of the Blender shipped
+       variable font
+
+   To regenerate, run scripts/vendor-fonts.sh from the repo root. The
+   subsets are deliberately small (latin + extended-latin + general
+   punctuation + arrows + box drawings) so first paint stays under one
+   network round trip in webkit. font-display: swap means the system
+   fallback stack paints immediately and the WOFF2 swaps in on load. */
+@font-face {
+  font-family: "Monaspace Krypton";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("/fonts/MonaspaceKrypton-Regular.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Monaspace Krypton";
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url("/fonts/MonaspaceKrypton-Medium.woff2") format("woff2");
+}
+@font-face {
+  font-family: "JetBrains Mono";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("/fonts/JetBrainsMono-Regular.woff2") format("woff2");
+}
+@font-face {
+  font-family: "JetBrains Mono";
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url("/fonts/JetBrainsMono-Medium.woff2") format("woff2");
+}
+@font-face {
+  /* Inter ships as a single variable font; the weight range covers
+     everything the brief calls for (regular at 400, medium at 500). */
+  font-family: "Inter";
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url("/fonts/Inter-Regular.woff2") format("woff2-variations"),
+       url("/fonts/Inter-Regular.woff2") format("woff2");
+}
