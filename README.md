@@ -1,17 +1,42 @@
-# moirai
+# Moirai
 
-> Previously known as `agent-router`. The rename is mechanical; on-disk
-> filesystem paths (`~/.config/agent-router/`, `~/.local/share/agent-router/`,
-> `.agent-router.toml`) are intentionally left unchanged in this commit so
-> existing trace data, configs, and per-repo settings keep working. They will
-> migrate in a follow-up commit.
+A three-model local coding daemon. **Planner**, **Coder**, and
+**Reviewer-Orchestrator** run as `llama-server` instances on a single GPU,
+swapped through VRAM one at a time. The Reviewer drives an LLM-orchestrated
+tool loop, calls the Planner and Coder when it needs them, runs `compile.run`
+and `test.run` against the working tree, and emits `done` or `fail` when the
+artifact is deliverable (or definitely isn't).
 
-A three-model local coding daemon. Planner, Coder, and Reviewer run as
-`llama-server` instances on a single 7900 XTX, swapped through VRAM one at a
-time. Daily driver for real repo work, not a benchmark toy.
+Daily driver for real repo work on Gary's box. Not a benchmark toy.
+
+```
+   user task
+       │
+       ▼
+   ┌──────────────────────────────────────────────────────────┐
+   │              Reviewer-Orchestrator (RO loop)             │
+   │   ask_planner · ask_coder · fs.* · test.run · compile.run│
+   │           pensive.search · done · fail                   │
+   └────────┬───────────────────────┬─────────────────────────┘
+            │ ask_planner           │ ask_coder
+            ▼                       ▼
+        Planner                  Coder
+        (one-shot plan)          (writes diffs against
+                                  working tree, gated by
+                                  acceptance criteria)
+            │                       │
+            └─────── single GPU ────┘
+                  one model VRAM-resident at a time
+```
 
 See `SPEC.md` for the long-form design and `SPEC_DEVIATIONS.md` for choices
-that diverged from the whiteboard.
+that diverged from the whiteboard. The 2026-04-27/28 reviewer optimization
+study (which model goes in which slot, what the failure modes are, and the
+path to a 90/100 reviewer) lives in `MOIRAI_OPTIMIZATION_TESTING.md`.
+
+Target hardware: AMD 7900 XTX (24 GB) with ROCm + a custom `llama-server`
+(`llama-cpp-turboquant`) for `turbo3` KV-cache compression; runs anywhere
+`llama-server` runs but the swap budget assumes a single fast GPU.
 
 ## Build
 
@@ -50,7 +75,11 @@ trace-diff <baseline-task>.jsonl <candidate-task>.jsonl
 
 ## Quickstart
 
-1. Create a config (optional; defaults are sane for Gary's box):
+1. Create a config (optional; defaults are sane). The setup below mirrors
+   the post-`MOIRAI_OPTIMIZATION_TESTING.md` recommendation — Qwen3.5-27B
+   for planning, `gpt-oss-20b` Q-quant in BOTH coder and reviewer slots
+   with the safe-mode spawn flags that work around the `openai_moe_iswa`
+   graph-reserve crash on default args:
 
    ```bash
    mkdir -p ~/.config/agent-router
@@ -59,14 +88,38 @@ trace-diff <baseline-task>.jsonl <candidate-task>.jsonl
      "port": 5984,
      "llama_server_bin": "/home/aegis/Projects/llama-cpp-turboquant/build/bin/llama-server",
      "default_repo": "/home/aegis/Projects/some-repo",
-     "max_coder_retries": 3,
-     "max_replans": 1,
+     "models_dir": "/home/aegis/Models",
+     "max_coder_retries": 5,
      "max_plan_revisions": 3,
      "max_ro_turns": 40,
      "models": {
-       "planner":  {"slot": "planner",  "model_path": "/home/aegis/Models/Qwen3.5-27B-Claude-Distill/Qwen3.5-27B-Claude-4.6-Opus-Reasoning-Distilled-Q4_K_M.gguf", "ctx_size": 8192, "n_gpu_layers": 99, "port": 8001},
-       "coder":    {"slot": "coder",    "model_path": "/home/aegis/Models/gpt-oss-20b-bf16.gguf",                                                                      "ctx_size": 8192, "n_gpu_layers": 99, "port": 8002},
-       "reviewer": {"slot": "reviewer", "model_path": "/home/aegis/Models/Ministral-3-14B-Reasoning/Ministral-3-14B-Instruct-2512-Q4_K_M.gguf",                        "ctx_size": 8192, "n_gpu_layers": 99, "port": 8003}
+       "planner": {
+         "slot": "planner",
+         "model_path": "/home/aegis/Models/Qwen3.5-27B-Claude-Distill/Qwen3.5-27B-Claude-4.6-Opus-Reasoning-Distilled-Q4_K_M.gguf",
+         "ctx_size": 32768,
+         "kv_cache": "turbo3",
+         "n_gpu_layers": 99,
+         "port": 8001,
+         "extra_args": ["-fa","on","--reasoning","on","--reasoning-format","deepseek","--reasoning-budget","-1","-np","1"]
+       },
+       "coder": {
+         "slot": "coder",
+         "model_path": "/home/aegis/Models/gpt-oss/gpt-oss-20b.gguf",
+         "ctx_size": 16384,
+         "kv_cache": "f16",
+         "n_gpu_layers": 99,
+         "port": 8002,
+         "extra_args": ["-fa","off","--no-warmup","-np","1"]
+       },
+       "reviewer": {
+         "slot": "reviewer",
+         "model_path": "/home/aegis/Models/gpt-oss/gpt-oss-20b.gguf",
+         "ctx_size": 32768,
+         "kv_cache": "f16",
+         "n_gpu_layers": 99,
+         "port": 8003,
+         "extra_args": ["-fa","off","--no-warmup","-np","1"]
+       }
      }
    }
    JSON
@@ -74,9 +127,10 @@ trace-diff <baseline-task>.jsonl <candidate-task>.jsonl
 
    The numeric override fields (`port`, `max_coder_retries`, `max_replans`,
    `max_plan_revisions`, `max_ro_turns`, `boot_timeout_seconds`) are decoded
-   as JSON pointers so that an explicit `0` is honored as "use this exact
-   value" rather than silently falling back to the built-in default. Omit
-   the key entirely to use the default.
+   as JSON pointers so an explicit `0` is honored as "use this exact value"
+   rather than silently falling back to the built-in default. Omit the key
+   entirely to use the default. `models_dir` (added 2026-04-28) is scanned
+   recursively for the `/models` picker.
 
 2. Start the daemon:
 
@@ -128,50 +182,49 @@ to reading the task store on disk if the daemon is down.
 | `/tasks/<id>/inject` | POST | `{"message": "..."}` - queue a user-authored guidance message for the running RO loop. 404 if unknown, 409 if terminal, 400 on empty message. Body capped at 256 KiB. |
 | `/tasks/<id>/interrupt` | POST | Soft interrupt: queues a fixed "stop your current line of reasoning" nudge. 404 if unknown, 409 if terminal. |
 | `/submit` | POST | `{"description": "...", "repo_root": "..."}`. Body capped at 256 KiB; unknown JSON fields rejected with 400. |
+| `/slots` | GET | View all slot configs and runtime status |
 | `/slots/<id>` | PATCH | Reconfigure a model slot (`model_path`, `ctx_size`, `kv_cache`). Body capped at 64 KiB; unknown fields rejected. |
+| `/models` | GET | List GGUFs under `models_dir` (recursive, depth-capped) plus any active slot paths |
 
 ## Workflow (what the daemon does to a task)
 
+The Reviewer-Orchestrator drives the loop end-to-end. Planner and Coder
+are LLM-callable tools, not separate phases — the Reviewer decides when to
+ask each, when to verify, and when to declare `done` or `fail`.
+
 ```
-         Planner A (VRAM)            |  Coder B and Reviewer C on disk
-              |
-              | plan
-              v
-         Reviewer C (VRAM)           |  Planner and Coder on disk
-              |
-              | approve/reject
-              v
-         Coder B (VRAM, tool loop)   |  Planner and Reviewer on disk
-              |
-              | diff
-              v
-         Reviewer C (VRAM)           |  approve -> commit, reject -> loop to B
-              |
-              v
-         Done: local branch + diff. No push. Ever.
+   Reviewer (VRAM, tool loop)
+        │
+        ├── ask_planner         → Planner produces plan text
+        ├── ask_coder           → Coder writes diffs against working tree
+        ├── fs.read / fs.write  → direct edits without the coder
+        ├── fs.search           → ripgrep within the repo
+        ├── compile.run         → run [commands].compile from .agent-router.toml
+        ├── test.run            → run [commands].test
+        ├── pensive.search      → recall reasoning atoms from past tasks
+        ├── pensive.emit_atom   → write a discovery/failure/insight atom
+        ├── done(summary)       → gated by acceptance criteria
+        └── fail(reason)        → ends the loop with a reason
 ```
+
+Acceptance gating: `done` is rejected when the planner-supplied acceptance
+criteria are not satisfied. The reviewer then has to either run the actual
+mechanical checks (compile/test) and try again, or call `fail` honestly.
+This is the "stop the reviewer from lying about completion" guard rail.
 
 Model swaps happen by killing the active `llama-server` and spawning a new
 one for the slot we need. See `SPEC_DEVIATIONS.md` for why we don't keep three
-servers alive in parallel.
+servers alive in parallel. Slot reuse is liveness-checked: before reusing a
+slot reported as `loaded=true`, the manager pings `/v1/models` with a 1-second
+timeout, and respawns on failure.
 
-Iteration caps (tunable via `max_coder_retries`, `max_replans` in config):
-the coder gets 3 attempts per plan, then the planner revises once, then
-the whole task fails and the branch is left for human review.
-
-## Tool loop
-
-When the coder is active, it's asked to emit tool calls wrapped as
-`<TOOL>{"name": "...", "args": {...}}</TOOL>`. The daemon executes each call
-and feeds the result back as `<RESULT>...</RESULT>`. Available tools:
-
-- `fs.read {"path"}` -> reads a file relative to repo root
-- `fs.write {"path", "content"}` -> writes a file
-- `fs.search {"pattern", "path"}` -> ripgrep
-- `shell.exec {"cmd"}` -> sandboxed shell (bwrap, network off)
-- `test.run {}` -> runs the configured test command
-- `compile.run {}` -> runs the configured compile command
-- `done {"summary"}` -> ends the tool loop
+Iteration caps (tunable via `max_coder_retries`, `max_plan_revisions`, and
+`max_ro_turns` in config). When the RO loop nears its budget — turn `N-8` or
+8 minutes of wall-clock left — the orchestrator injects a soft directive
+demanding `done` or `fail` rather than starting new work. At `N-2` or 2
+minutes left the directive becomes a hard demand. This is the "force-conclude"
+mechanism that keeps the reviewer from running out the clock without ever
+declaring an outcome.
 
 File writes honor `.agent-router.toml`'s `[forbidden].paths` list. Paths
 outside the repo root are always rejected.
@@ -278,12 +331,38 @@ Two smoke tests live in the repo root:
 - Phase 1 (daemon + model manager): done.
 - Phase 4 (tools + AEGIS + sandbox): done.
 - Phase 7 (diff-gate + trace + inspect/abort + per-repo config): done.
+- Reviewer optimization (which model goes where, why the current
+  defaults are what they are): documented in
+  `MOIRAI_OPTIMIZATION_TESTING.md`. Best reviewer score 82/100 with the
+  default harness, +15 from the F8/F9 changes that landed in this branch;
+  path to 90 sketched in `docs/superpowers/plans/2026-04-28-moirai-multi-gpu.md`.
 - Phase 5/6 (reviewer and coder training): another agent's job. This
-  framework loads any GGUF you point the config at, so when the trained
+  framework loads any GGUF you point the config at, so when trained
   checkpoints land you just swap paths.
+
+## Naming
+
+Moirai was previously called `agent-router`. The on-disk filesystem paths
+are intentionally still `agent-router`-named:
+
+| Old name | Why it still exists |
+|----------|---------------------|
+| `~/.config/agent-router/config.json` | Config file. Renaming would break every operator's setup. |
+| `~/.local/share/agent-router/{tasks,traces,logs,scratch}/` | Years of trace data live here. |
+| `.agent-router.toml` | Per-repo config in already-published repos. |
+
+The daemon binary, the Phos UI shell, and the public-facing project name
+are all "Moirai." Path migration to `~/.config/moirai/` etc. is a future
+chore tracked separately. Until then, the old paths are the single source
+of truth.
 
 ## See also
 
-- `SPEC.md`: full design.
-- `SPEC_DEVIATIONS.md`: choices that diverged from the spec and why.
-- `smoke-test.sh`: end-to-end sanity script.
+- `SPEC.md` — full design.
+- `SPEC_DEVIATIONS.md` — choices that diverged from the spec and why.
+- `MOIRAI_OPTIMIZATION_TESTING.md` — 11-reviewer bake-off, rubric, harness
+  experiment, path to 90/100.
+- `docs/superpowers/plans/2026-04-28-moirai-multi-gpu.md` — multi-GPU
+  implementation plan (R9700 dual + per-slot pinning).
+- `smoke-test.sh` — end-to-end sanity script (real GGUFs).
+- `smoke-test-ro.sh` — RO-loop smoke test (no real LLMs; Python stubs).
