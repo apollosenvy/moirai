@@ -102,13 +102,27 @@ func defaultConfig() Config {
 		copy(out, in)
 		return out
 	}
+	// Default model paths use $HOME/Models/<family>/<gguf> placeholders.
+	// Operators are expected to either (a) place GGUFs at these exact
+	// paths, or (b) override every model_path in
+	// ~/.config/agent-router/config.json. The defaults exist so a fresh
+	// `moirai daemon` invocation produces a clear "model file missing
+	// for slot X" error rather than panicking on an empty config; they
+	// are NOT magic locations the project ships GGUFs to.
+	modelsBase := filepath.Join(home, "Models")
+	llamaServerBin := os.Getenv("MOIRAI_LLAMA_SERVER")
+	if llamaServerBin == "" {
+		// Fall back to PATH lookup at runtime; absence is handled in
+		// modelmgr.New() with a clear error.
+		llamaServerBin = "llama-server"
+	}
 	return Config{
 		Port:           5984,
-		LlamaServerBin: "/home/aegis/Projects/llama-cpp-turboquant/build/bin/llama-server",
+		LlamaServerBin: llamaServerBin,
 		Models: map[modelmgr.Slot]modelmgr.ModelConfig{
 			modelmgr.SlotPlanner: {
 				Slot:       modelmgr.SlotPlanner,
-				ModelPath:  "/home/aegis/Models/Qwen3.5-27B-Claude-Distill/Qwen3.5-27B-Claude-4.6-Opus-Reasoning-Distilled-Q4_K_M.gguf",
+				ModelPath:  filepath.Join(modelsBase, "Qwen3.5-27B-Claude-Distill", "Qwen3.5-27B-Claude-4.6-Opus-Reasoning-Distilled-Q4_K_M.gguf"),
 				CtxSize:    262144,
 				NGpuLayers: 99,
 				Port:       8001,
@@ -116,7 +130,7 @@ func defaultConfig() Config {
 			},
 			modelmgr.SlotCoder: {
 				Slot:       modelmgr.SlotCoder,
-				ModelPath:  "/home/aegis/Models/gpt-oss-20b-bf16.gguf",
+				ModelPath:  filepath.Join(modelsBase, "gpt-oss", "gpt-oss-20b.gguf"),
 				CtxSize:    131072,
 				NGpuLayers: 99,
 				Port:       8002,
@@ -124,7 +138,7 @@ func defaultConfig() Config {
 			},
 			modelmgr.SlotReviewer: {
 				Slot:       modelmgr.SlotReviewer,
-				ModelPath:  "/home/aegis/Models/Ministral-3-14B-Reasoning/Ministral-3-14B-Instruct-2512-Q4_K_M.gguf",
+				ModelPath:  filepath.Join(modelsBase, "Ministral-3-14B-Reasoning", "Ministral-3-14B-Instruct-2512-Q4_K_M.gguf"),
 				CtxSize:    524288,
 				NGpuLayers: 99,
 				Port:       8003,
@@ -135,7 +149,7 @@ func defaultConfig() Config {
 		LogDir:          filepath.Join(base, "logs"),
 		MaxCoderRetries: 5,
 		MaxReplans:      3,
-		ModelsDir:       filepath.Join(home, "models"),
+		ModelsDir:       modelsBase,
 	}
 }
 
